@@ -76,19 +76,18 @@ def load_json(path: str) -> dict:
 
 class CryptoFeed:
     """
-    Maintains a live Binance WebSocket stream for BTC/ETH/SOL.
-    Prices update the moment Binance ticks — no polling lag.
-    Falls back to REST if WebSocket fails.
+    Polls Binance REST for BTC/ETH/SOL prices every 2 seconds.
+    Uses /api/v3/ticker/bookTicker for best bid/ask (same data as WS bookTicker).
+    WebSocket wss:// is blocked on Render (HTTP 451); REST works fine.
     """
     SYMBOLS = ["btcusdt", "ethusdt", "solusdt"]
-    WS_URL  = "wss://stream.binance.com:9443/stream?streams=" + \
-              "/".join(f"{s}@bookTicker" for s in SYMBOLS)
+    REST_POLL_SEC = 2  # poll interval — fast enough for latency arb signals
 
     def __init__(self):
         self._prices: Dict[str, CryptoPrice] = {}
         self._hist:   Dict[str, List[Tuple[float,float]]] = {}
         self._pct24:  Dict[str, float] = {}
-        self._ws_ok   = False
+        self._ws_ok   = True   # always True — we use REST, no WS to fail
         self._session: Optional[aiohttp.ClientSession] = None
 
     def set_session(self, s: aiohttp.ClientSession):
@@ -110,35 +109,39 @@ class CryptoFeed:
         self._prices[sym] = CryptoPrice(sym, round(price,2), bid, ask, ret5, pct24)
 
     async def run_forever(self):
-        """Background task — reconnects on any failure."""
-        # First fetch 24h change via REST (refreshed every 5 min)
+        """Background task — polls REST every REST_POLL_SEC seconds."""
         asyncio.create_task(self._refresh_24h_loop())
+        log.info("CryptoFeed: starting REST polling (WebSocket blocked on Render)")
         while True:
             try:
-                await self._ws_loop()
+                await self._poll_once()
             except Exception as e:
-                log.warning(f"CryptoFeed WS error: {e} — reconnecting in 3s")
-                self._ws_ok = False
-                await asyncio.sleep(3)
+                log.warning(f"CryptoFeed REST poll error: {e}")
+            await asyncio.sleep(self.REST_POLL_SEC)
 
-    async def _ws_loop(self):
-        log.info("CryptoFeed: connecting to Binance WebSocket...")
-        async with self._session.ws_connect(
-                self.WS_URL,
-                heartbeat=20) as ws:
-            self._ws_ok = True
-            log.info("CryptoFeed: Binance WebSocket CONNECTED")
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-                    stream = data.get("stream","")
-                    d      = data.get("data", {})
-                    # bookTicker: b=best bid, a=best ask
-                    sym = stream.split("@")[0]
-                    if sym in self.SYMBOLS and d.get("b") and d.get("a"):
-                        self._update(sym, float(d["b"]), float(d["a"]))
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    break
+    async def _poll_once(self):
+        """Fetch best bid/ask for all symbols in one batch request."""
+        if not self._session:
+            return
+        # Use batch bookTicker — single request for all symbols
+        symbols_json = "[" + ",".join(f'"{s.upper()}"' for s in self.SYMBOLS) + "]"
+        try:
+            async with self._session.get(
+                f"{BINANCE_REST}/api/v3/ticker/bookTicker",
+                params={"symbols": symbols_json},
+                timeout=aiohttp.ClientTimeout(total=5),
+                headers={"Accept": "application/json"}
+            ) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    for item in data:
+                        sym = item.get("symbol", "").lower()
+                        if sym in self.SYMBOLS and item.get("bidPrice") and item.get("askPrice"):
+                            self._update(sym, float(item["bidPrice"]), float(item["askPrice"]))
+                else:
+                    log.debug(f"CryptoFeed bookTicker → {r.status}")
+        except Exception as e:
+            log.debug(f"CryptoFeed _poll_once: {e}")
 
     async def _refresh_24h_loop(self):
         """Refresh 24h % change from REST every 5 minutes."""
@@ -159,7 +162,7 @@ class CryptoFeed:
                             if r.status == 200:
                                 d = await r.json(content_type=None)
                                 self._pct24[sym] = float(d.get("priceChangePercent", 0))
-                                # If WS hasn't connected yet, seed price from REST
+                                # Seed price from REST if not yet populated
                                 if sym not in self._prices and d.get("lastPrice"):
                                     p = float(d["lastPrice"])
                                     self._update(sym, p*0.9995, p*1.0005)
