@@ -120,28 +120,40 @@ class CryptoFeed:
             await asyncio.sleep(self.REST_POLL_SEC)
 
     async def _poll_once(self):
-        """Fetch best bid/ask for all symbols in one batch request."""
+        """Fetch best bid/ask for all symbols via concurrent individual requests."""
         if not self._session:
             return
-        # Use batch bookTicker — single request for all symbols
-        symbols_json = "[" + ",".join(f'"{s.upper()}"' for s in self.SYMBOLS) + "]"
-        try:
-            async with self._session.get(
+        tasks = [
+            self._session.get(
                 f"{BINANCE_REST}/api/v3/ticker/bookTicker",
-                params={"symbols": symbols_json},
+                params={"symbol": s.upper()},
                 timeout=aiohttp.ClientTimeout(total=5),
                 headers={"Accept": "application/json"}
-            ) as r:
-                if r.status == 200:
-                    data = await r.json(content_type=None)
-                    for item in data:
-                        sym = item.get("symbol", "").lower()
-                        if sym in self.SYMBOLS and item.get("bidPrice") and item.get("askPrice"):
-                            self._update(sym, float(item["bidPrice"]), float(item["askPrice"]))
-                else:
-                    log.debug(f"CryptoFeed bookTicker → {r.status}")
-        except Exception as e:
-            log.debug(f"CryptoFeed _poll_once: {e}")
+            ) for s in self.SYMBOLS
+        ]
+        resps = await asyncio.gather(*tasks, return_exceptions=True)
+        got = 0
+        for sym, resp in zip(self.SYMBOLS, resps):
+            if isinstance(resp, Exception):
+                log.warning(f"CryptoFeed poll {sym}: {resp}")
+                continue
+            try:
+                async with resp as r:
+                    if r.status == 200:
+                        d = await r.json(content_type=None)
+                        bid = d.get("bidPrice") or d.get("price")
+                        ask = d.get("askPrice") or d.get("price")
+                        if bid and ask:
+                            self._update(sym, float(bid), float(ask))
+                            got += 1
+                    else:
+                        body = await r.text()
+                        log.warning(f"CryptoFeed poll {sym} → {r.status}: {body[:120]}")
+            except Exception as e:
+                log.warning(f"CryptoFeed parse {sym}: {e}")
+        if got > 0 and not hasattr(self, "_logged_ok"):
+            log.info(f"CryptoFeed REST polling OK — got {got}/{len(self.SYMBOLS)} symbols")
+            self._logged_ok = True
 
     async def _refresh_24h_loop(self):
         """Refresh 24h % change from REST every 5 minutes."""
