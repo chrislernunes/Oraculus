@@ -123,12 +123,9 @@ class CryptoFeed:
 
     async def _ws_loop(self):
         log.info("CryptoFeed: connecting to Binance WebSocket...")
-        ws_timeout_cls = getattr(aiohttp, "ClientWSTimeout", None)
-        ws_timeout = ws_timeout_cls(ws_close=10) if ws_timeout_cls else 10
         async with self._session.ws_connect(
                 self.WS_URL,
-                heartbeat=20,
-                timeout=ws_timeout) as ws:
+                heartbeat=20) as ws:
             self._ws_ok = True
             log.info("CryptoFeed: Binance WebSocket CONNECTED")
             async for msg in ws:
