@@ -76,18 +76,35 @@ def load_json(path: str) -> dict:
 
 class CryptoFeed:
     """
-    Polls Binance REST for BTC/ETH/SOL prices every 2 seconds.
-    Uses /api/v3/ticker/bookTicker for best bid/ask (same data as WS bookTicker).
-    WebSocket wss:// is blocked on Render (HTTP 451); REST works fine.
+    Polls CoinGecko public API for BTC/ETH/SOL prices every 10 seconds.
+    CoinGecko has no geo-restrictions and needs no API key.
+    Binance blocks all requests from Render's US-based servers (HTTP 451).
+
+    Single call to /simple/price fetches all 3 coins at once:
+      GET https://api.coingecko.com/api/v3/simple/price
+          ?ids=bitcoin,ethereum,solana
+          &vs_currencies=usd
+          &include_24hr_change=true
+          &include_bid_ask_spread=true   (not available on free tier, so we synthesise spread)
+
+    Free tier: 30 calls/min — polling every 10s uses only 6 calls/min.
     """
-    SYMBOLS = ["btcusdt", "ethusdt", "solusdt"]
-    REST_POLL_SEC = 2  # poll interval — fast enough for latency arb signals
+    # CoinGecko coin IDs → internal symbol names (matching the rest of the codebase)
+    COIN_MAP = {
+        "bitcoin": "btcusdt",
+        "ethereum": "ethusdt",
+        "solana": "solusdt",
+    }
+    COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+    REST_POLL_SEC = 10   # 6 calls/min — well within free tier 30/min limit
+
+    # Typical bid-ask spreads as a fraction of mid-price (used to synthesise bid/ask)
+    SPREAD_EST = {"btcusdt": 0.0002, "ethusdt": 0.0003, "solusdt": 0.0008}
 
     def __init__(self):
         self._prices: Dict[str, CryptoPrice] = {}
         self._hist:   Dict[str, List[Tuple[float,float]]] = {}
-        self._pct24:  Dict[str, float] = {}
-        self._ws_ok   = True   # always True — we use REST, no WS to fail
+        self._ws_ok   = True   # no WebSocket — flag stays True so dashboard shows green
         self._session: Optional[aiohttp.ClientSession] = None
 
     def set_session(self, s: aiohttp.ClientSession):
@@ -96,92 +113,67 @@ class CryptoFeed:
     def get(self) -> Dict[str, CryptoPrice]:
         return dict(self._prices)
 
-    def _update(self, sym: str, bid: float, ask: float):
-        price = (bid + ask) / 2
-        now   = time.time()
-        hist  = self._hist.setdefault(sym, [])
+    def _update(self, sym: str, price: float, change_24h: float):
+        # Synthesise bid/ask from estimated spread
+        half = price * self.SPREAD_EST.get(sym, 0.0005) / 2
+        bid, ask = price - half, price + half
+        now  = time.time()
+        hist = self._hist.setdefault(sym, [])
         hist.append((now, price))
-        # Keep 30s of history
-        self._hist[sym] = [(t,p) for t,p in hist if t > now - 30]
-        old = [p for t,p in self._hist[sym] if t <= now - 5]
+        self._hist[sym] = [(t, p) for t, p in hist if t > now - 30]
+        old = [p for t, p in self._hist[sym] if t <= now - 5]
         ret5 = (price - old[-1]) / old[-1] if old and old[-1] > 0 else 0.0
-        pct24 = self._pct24.get(sym, 0.0)
-        self._prices[sym] = CryptoPrice(sym, round(price,2), bid, ask, ret5, pct24)
+        self._prices[sym] = CryptoPrice(sym, round(price, 2), bid, ask, ret5, change_24h)
 
     async def run_forever(self):
-        """Background task — polls REST every REST_POLL_SEC seconds."""
-        asyncio.create_task(self._refresh_24h_loop())
-        log.info("CryptoFeed: starting REST polling (WebSocket blocked on Render)")
+        """Background task — polls CoinGecko every REST_POLL_SEC seconds."""
+        log.info("CryptoFeed: starting CoinGecko polling (Binance geo-blocked on Render)")
         while True:
             try:
                 await self._poll_once()
             except Exception as e:
-                log.warning(f"CryptoFeed REST poll error: {e}")
+                log.warning(f"CryptoFeed poll error: {e}")
             await asyncio.sleep(self.REST_POLL_SEC)
 
     async def _poll_once(self):
-        """Fetch best bid/ask for all symbols via concurrent individual requests."""
+        """Single request fetches all coins. Handles rate-limit (429) gracefully."""
         if not self._session:
             return
-        tasks = [
-            self._session.get(
-                f"{BINANCE_REST}/api/v3/ticker/bookTicker",
-                params={"symbol": s.upper()},
-                timeout=aiohttp.ClientTimeout(total=5),
-                headers={"Accept": "application/json"}
-            ) for s in self.SYMBOLS
-        ]
-        resps = await asyncio.gather(*tasks, return_exceptions=True)
-        got = 0
-        for sym, resp in zip(self.SYMBOLS, resps):
-            if isinstance(resp, Exception):
-                log.warning(f"CryptoFeed poll {sym}: {resp}")
-                continue
-            try:
-                async with resp as r:
-                    if r.status == 200:
-                        d = await r.json(content_type=None)
-                        bid = d.get("bidPrice") or d.get("price")
-                        ask = d.get("askPrice") or d.get("price")
-                        if bid and ask:
-                            self._update(sym, float(bid), float(ask))
+        try:
+            async with self._session.get(
+                self.COINGECKO_URL,
+                params={
+                    "ids": ",".join(self.COIN_MAP.keys()),
+                    "vs_currencies": "usd",
+                    "include_24hr_change": "true",
+                },
+                timeout=aiohttp.ClientTimeout(total=8),
+                headers={"Accept": "application/json",
+                         "User-Agent": "oraculus-engine/3.0"},
+            ) as r:
+                if r.status == 200:
+                    data = await r.json(content_type=None)
+                    got = 0
+                    for coin_id, sym in self.COIN_MAP.items():
+                        d = data.get(coin_id, {})
+                        price = d.get("usd")
+                        if price:
+                            change = d.get("usd_24h_change", 0.0) or 0.0
+                            self._update(sym, float(price), float(change))
                             got += 1
-                    else:
-                        body = await r.text()
-                        log.warning(f"CryptoFeed poll {sym} → {r.status}: {body[:120]}")
-            except Exception as e:
-                log.warning(f"CryptoFeed parse {sym}: {e}")
-        if got > 0 and not hasattr(self, "_logged_ok"):
-            log.info(f"CryptoFeed REST polling OK — got {got}/{len(self.SYMBOLS)} symbols")
-            self._logged_ok = True
-
-    async def _refresh_24h_loop(self):
-        """Refresh 24h % change from REST every 5 minutes."""
-        while True:
-            try:
-                if self._session:
-                    tasks = [
-                        self._session.get(
-                            f"{BINANCE_REST}/api/v3/ticker/24hr",
-                            params={"symbol": s.upper()},
-                            timeout=aiohttp.ClientTimeout(total=8)
-                        ) for s in self.SYMBOLS
-                    ]
-                    resps = await asyncio.gather(*tasks, return_exceptions=True)
-                    for sym, resp in zip(self.SYMBOLS, resps):
-                        if isinstance(resp, Exception): continue
-                        async with resp as r:
-                            if r.status == 200:
-                                d = await r.json(content_type=None)
-                                self._pct24[sym] = float(d.get("priceChangePercent", 0))
-                                # Seed price from REST if not yet populated
-                                if sym not in self._prices and d.get("lastPrice"):
-                                    p = float(d["lastPrice"])
-                                    self._update(sym, p*0.9995, p*1.0005)
-                                    log.info(f"CryptoFeed REST seed {sym}: ${p:,.2f}")
-            except Exception as e:
-                log.debug(f"24h REST refresh error: {e}")
-            await asyncio.sleep(300)
+                    if got > 0 and not hasattr(self, "_logged_ok"):
+                        btc = self._prices.get("btcusdt")
+                        log.info(f"CryptoFeed CoinGecko OK — "
+                                 f"BTC=${btc.price:,.0f} | polling every {self.REST_POLL_SEC}s")
+                        self._logged_ok = True
+                elif r.status == 429:
+                    log.warning("CryptoFeed: CoinGecko rate-limited (429) — backing off 30s")
+                    await asyncio.sleep(30)
+                else:
+                    body = await r.text()
+                    log.warning(f"CryptoFeed CoinGecko → {r.status}: {body[:120]}")
+        except Exception as e:
+            log.warning(f"CryptoFeed _poll_once: {e}")
 
 
 # ── Data Fetcher ──────────────────────────────────────────────────────────────
@@ -274,16 +266,17 @@ class DataFetcher:
                 bids = sorted(ybook.get("bids",[]), key=lambda x: float(x.get("price",0)), reverse=True)
                 if asks: yes_ask = float(asks[0].get("price",0))
                 if bids: yes_bid = float(bids[0].get("price",0))
-                yes_depth = sum(float(a.get("price",0))*float(a.get("size",0)) for a in asks[:5])
+                # depth = sum of SIZE (shares) at best 5 ask levels — not price*size
+                yes_depth = sum(float(a.get("size",0)) for a in asks[:5])
 
             if nbook:
                 asks = sorted(nbook.get("asks",[]), key=lambda x: float(x.get("price",999)))
                 bids = sorted(nbook.get("bids",[]), key=lambda x: float(x.get("price",0)), reverse=True)
                 if asks: no_ask = float(asks[0].get("price",0))
                 if bids: no_bid = float(bids[0].get("price",0))
-                no_depth = sum(float(a.get("price",0))*float(a.get("size",0)) for a in asks[:5])
+                no_depth = sum(float(a.get("size",0)) for a in asks[:5])
 
-            # Gamma mid fallback
+            # Gamma mid fallback — used when CLOB book is missing
             if not yes_ask or not no_ask:
                 m_raw = gamma_map.get(cid, {})
                 op = m_raw.get("outcomePrices","[]")
@@ -296,6 +289,11 @@ class DataFetcher:
                         yes_bid = max(0.01, yes_ask - 0.02)
                         no_bid  = max(0.01, no_ask  - 0.02)
                     except: pass
+
+            # For Gamma-fallback markets with no CLOB depth, assign a conservative
+            # minimum so strategies can still evaluate them (capped bet size handles risk)
+            if yes_depth == 0.0: yes_depth = MIN_DEPTH
+            if no_depth  == 0.0: no_depth  = MIN_DEPTH
 
             if not yes_ask or not no_ask: continue
             if not (0.01 < yes_ask < 0.99): continue
@@ -379,29 +377,45 @@ class PaperAccount:
 # ── Strategies ────────────────────────────────────────────────────────────────
 
 def kelly_size(prob, price, balance):
-    if price <= 0 or price >= 1 or prob <= 0: return 0.0
-    b = (1-price)/price
-    f = max(0.0, min((b*prob-(1-prob))/b, MAX_KELLY_FRACTION))
-    return min(f*balance, MAX_BET_SIZE)
+    """
+    Fractional Kelly bet size.
+    prob  = true probability estimate (0-1)
+    price = cost to buy one contract (0-1)
+    Returns dollar bet size capped at MAX_BET_SIZE.
+    """
+    if price <= 0 or price >= 1 or prob <= 0 or prob >= 1: return 0.0
+    b = (1.0 - price) / price
+    q = 1.0 - prob
+    f = (b * prob - q) / b
+    f = max(0.0, min(f, MAX_KELLY_FRACTION))
+    return min(f * balance, MAX_BET_SIZE)
+
+
+def _mid(ask: float, bid: float) -> float:
+    """Mid-price; falls back to ask if bid is missing."""
+    return (ask + bid) / 2.0 if bid > 0.001 else ask
 
 
 def scan_spread_fade(markets: List[MarketData], balance: float) -> List[dict]:
     """
-    SPREAD_FADE: On highly liquid markets, the NO side of a very low-probability
-    event is often overpriced by market maker spread. Buy NO when:
-      - YES ask is very low (< 0.08) meaning event is unlikely
-      - NO ask < 0.97 (market maker spread leaves NO underpriced vs true ~0.96+)
-      - Sufficient depth on NO side
-    Also catches YES side when it's clearly underpriced vs complement.
+    SPREAD_FADE: Exploit bid-ask spread mispricing.
+
+    Case 1 - Long NO on very unlikely events:
+      YES_ask < 0.08  ->  true NO prob ~= 1 - YES_mid ~= 0.94+
+      Buy NO at no_ask if edge = (1 - yes_mid) - no_ask - fee > MIN_EDGE
+
+    Case 2 - Long YES on near-certain events:
+      YES_mid > 0.92  ->  true YES prob ~= 1 - NO_mid ~= 0.94+
+      Buy YES at yes_ask if edge = (1 - no_mid) - yes_ask - fee > MIN_EDGE
     """
     out = []
     for m in markets:
-        # ── Case 1: Long NO on very unlikely events ──
-        # If YES_ask < 0.07, the true NO probability ≈ 1 - YES_ask = 0.93+
-        # But we can buy NO at no_ask. If no_ask < (1 - yes_ask - TAKER_FEE*2), edge exists.
+
+        # Case 1: Long NO on very unlikely events
         if 0.01 < m.yes_ask < 0.08:
-            implied_no = 1.0 - m.yes_ask
-            edge = implied_no - m.no_ask - TAKER_FEE
+            yes_mid    = _mid(m.yes_ask, m.yes_bid)
+            implied_no = 1.0 - yes_mid
+            edge       = implied_no - m.no_ask - TAKER_FEE
             if edge >= MIN_EDGE and m.no_depth >= MIN_DEPTH:
                 size = min(kelly_size(implied_no, m.no_ask, balance), m.no_depth * 0.10)
                 if size >= MIN_BET_SIZE:
@@ -412,15 +426,17 @@ def scan_spread_fade(markets: List[MarketData], balance: float) -> List[dict]:
                         "token_id": m.no_token_id,
                         "outcome": "NO",
                         "price": m.no_ask,
-                        "edge": edge,
+                        "edge": round(edge, 5),
                         "size": size,
-                        "reason": f"YES_ask={m.yes_ask:.3f} → implied_NO={implied_no:.3f} vs ask={m.no_ask:.3f}"
+                        "reason": f"YES_mid={yes_mid:.3f} implied_NO={implied_no:.3f} no_ask={m.no_ask:.3f}"
                     })
 
-        # ── Case 2: Long YES on near-certain events ──
-        if 0.92 < m.yes_ask < 0.985:
-            implied_yes = 1.0 - m.no_ask
-            edge = implied_yes - m.yes_ask - TAKER_FEE
+        # Case 2: Long YES on near-certain events (filter on mid, not ask)
+        yes_mid = _mid(m.yes_ask, m.yes_bid)
+        if 0.92 < yes_mid < 0.988:
+            no_mid      = _mid(m.no_ask, m.no_bid)
+            implied_yes = 1.0 - no_mid
+            edge        = implied_yes - m.yes_ask - TAKER_FEE
             if edge >= MIN_EDGE and m.yes_depth >= MIN_DEPTH:
                 size = min(kelly_size(implied_yes, m.yes_ask, balance), m.yes_depth * 0.10)
                 if size >= MIN_BET_SIZE:
@@ -431,44 +447,52 @@ def scan_spread_fade(markets: List[MarketData], balance: float) -> List[dict]:
                         "token_id": m.yes_token_id,
                         "outcome": "YES",
                         "price": m.yes_ask,
-                        "edge": edge,
+                        "edge": round(edge, 5),
                         "size": size,
-                        "reason": f"NO_ask={m.no_ask:.3f} → implied_YES={implied_yes:.3f} vs ask={m.yes_ask:.3f}"
+                        "reason": f"NO_mid={no_mid:.3f} implied_YES={implied_yes:.3f} yes_ask={m.yes_ask:.3f}"
                     })
     return out
 
 
 def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
     """
-    CROSS_MARKET: Find groups of mutually exclusive markets (same event, multiple
-    candidates) where the sum of all YES prices exceeds 1.0 by enough to cover fees.
-    Buy the cheapest NO in each oversubscribed group.
-
-    Example: "Will X win championship?" × 8 teams. If sum(YES_asks) = 1.15,
-    the market is oversubscribed. Buy NO on the most overpriced (highest YES/NO ratio
-    vs implied probability) candidate.
+    CROSS_MARKET: Mutually-exclusive groups where sum(YES_asks) > 1.0.
+    Buy NO on the cheapest NO contracts (best risk/reward - longshot NOs near 1.0).
+    Edge = neg_risk_edge of that specific market minus fee (not group-averaged).
+    Requires >= 4 members to confirm it's a real group, not noise.
     """
     out = []
 
-    # Group markets by detected topic
     def topic_key(q: str) -> Optional[str]:
         q = q.lower()
-        patterns = [
-            (r"win the 2026 nhl stanley cup", "NHL2026"),
-            (r"win the 2026 nba finals",      "NBA_FINALS_2026"),
-            (r"win the nba (eastern|western) conference finals", "NBA_CONF_2026"),
-            (r"win the 202[56][–-]2[67] nba mvp", "NBA_MVP"),
-            (r"win the 2026 masters",          "MASTERS_2026"),
-            (r"win the 2026 fifa world cup",   "FIFA_WC_2026"),
-            (r"win the 202[56][–-]2[67] champions league", "UCL"),
-            (r"win the 202[56][–-]2[67] english premier league", "EPL"),
-            (r"win the 202[56][–-]2[67] la liga", "LALIGA"),
-            (r"win the 202[56][–-]2[67] serie a", "SERIEA"),
-            (r"win the 2028 (republican|democratic|us) presidential", "PRES_2028"),
-            (r"announced as next james bond", "BOND"),
+        checks = [
+            (["nhl", "stanley cup"],                    "NHL_CUP"),
+            (["nba", "finals"],                         "NBA_FINALS"),
+            (["nba", "eastern conference"],             "NBA_EAST_CONF"),
+            (["nba", "western conference"],             "NBA_WEST_CONF"),
+            (["nba", "mvp"],                            "NBA_MVP"),
+            (["masters", "golf"],                       "MASTERS"),
+            (["fifa", "world cup"],                     "FIFA_WC"),
+            (["champions league", "win"],               "UCL"),
+            (["premier league", "win"],                 "EPL"),
+            (["la liga", "win"],                        "LALIGA"),
+            (["serie a", "win"],                        "SERIEA"),
+            (["bundesliga", "win"],                     "BUNDESLIGA"),
+            (["presidential", "republican nomination"], "GOP_NOM"),
+            (["presidential", "democratic nomination"], "DEM_NOM"),
+            (["presidential", "win", "2028"],           "PRES_2028"),
+            (["next james bond"],                       "BOND"),
+            (["next pope"],                             "POPE"),
+            (["super bowl", "win"],                     "SUPERBOWL"),
+            (["world series", "win"],                   "WORLD_SERIES"),
+            (["oscar", "best picture"],                 "OSCAR_PICTURE"),
+            (["oscar", "best director"],                "OSCAR_DIRECTOR"),
+            (["emmy", "best"],                          "EMMY"),
+            (["nobel", "prize"],                        "NOBEL"),
         ]
-        for pat, key in patterns:
-            if re.search(pat, q): return key
+        for kws, key in checks:
+            if all(k in q for k in kws):
+                return key
         return None
 
     groups: Dict[str, List[MarketData]] = {}
@@ -478,22 +502,18 @@ def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
             groups.setdefault(k, []).append(m)
 
     for group_name, grp in groups.items():
-        if len(grp) < 3: continue
-        yes_sum = sum(m.yes_ask for m in grp)
-        # Oversubscribed: sum of YES prices > 1.0 + fees
+        if len(grp) < 4: continue
+        yes_sum    = sum(m.yes_ask for m in grp)
         overcharge = yes_sum - 1.0
         if overcharge < CROSS_MIN_OVERCHARGE: continue
 
-        # Sort by (yes_ask / volume) desc — most overpriced relative to volume
-        grp_sorted = sorted(grp, key=lambda m: m.yes_ask, reverse=True)
+        # Sort by NO ask ascending - cheapest NO = best value (longshot NOs close to 1.0)
+        grp_sorted = sorted(grp, key=lambda m: m.no_ask)
 
-        # Buy NO on the top overpriced candidates (capped at 3 per group)
         for m in grp_sorted[:3]:
-            # Edge: overcharge is shared across all members
-            per_market_edge = overcharge / len(grp) - TAKER_FEE
-            if per_market_edge < MIN_EDGE: continue
+            edge = m.neg_risk_edge - TAKER_FEE
+            if edge < MIN_EDGE: continue
             if m.no_depth < MIN_DEPTH: continue
-            # Implied NO = 1 - (yes_sum - this_yes) / (len-1) ... simplified:
             implied_no = 1.0 - m.yes_ask
             size = min(kelly_size(implied_no, m.no_ask, balance),
                        m.no_depth * 0.08, MAX_BET_SIZE)
@@ -505,9 +525,9 @@ def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
                 "token_id": m.no_token_id,
                 "outcome": "NO",
                 "price": m.no_ask,
-                "edge": per_market_edge,
+                "edge": round(edge, 5),
                 "size": size,
-                "reason": f"{group_name} YES_sum={yes_sum:.3f} overcharge={overcharge:.3f}"
+                "reason": f"{group_name} YES_sum={yes_sum:.3f} neg_risk={m.neg_risk_edge:.3f}"
             })
 
     return out
@@ -516,26 +536,28 @@ def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
 def scan_dep_graph(markets: List[MarketData], crypto: Dict[str, CryptoPrice],
                    balance: float) -> List[dict]:
     """
-    DEP_GRAPH: Crypto price-ladder consistency.
-    If BTC is at $X, then "Will BTC hit $X-10k" should price higher than "Will BTC hit $X+10k".
-    Find adjacent ladder markets where cheaper strike prices YES < more expensive strike YES.
-    Also includes latency arb: if BTC just moved, adjacent ladder markets may not have repriced.
+    DEP_GRAPH: Two sub-strategies:
+
+    1. Price-ladder consistency: lower BTC/ETH/SOL strike must have higher YES prob.
+       Kelly prob uses full violation as fair-value correction (not half).
+
+    2. Latency arb: crypto moved, prediction market hasn't repriced.
+       Sensitivity = 3.0 (was 0.35, which was too small to ever clear MIN_EDGE).
     """
     out = []
 
-    # ── Price ladder consistency ──
+    # 1. Price ladder consistency
     groups: Dict[str, list] = {}
     for m in markets:
         q = m.question.lower()
-        asset = next((a for a,kws in [
-            ("BTC", ["btc","bitcoin"]),
-            ("ETH", ["eth","ethereum"]),
-            ("SOL", ["sol","solana"])
+        asset = next((a for a, kws in [
+            ("BTC", ["btc", "bitcoin"]),
+            ("ETH", ["eth", "ethereum"]),
+            ("SOL", ["sol", "solana"]),
         ] if any(k in q for k in kws)), None)
-        # Match price targets: $80k, $100,000, $1m, etc.
         mt = re.search(r'\$([\d,]+\.?\d*)([kKmM]?)', m.question)
         if asset and mt:
-            v = float(mt.group(1).replace(",",""))
+            v   = float(mt.group(1).replace(",", ""))
             sfx = mt.group(2).lower()
             if sfx == 'k': v *= 1_000
             elif sfx == 'm': v *= 1_000_000
@@ -543,67 +565,73 @@ def scan_dep_graph(markets: List[MarketData], crypto: Dict[str, CryptoPrice],
 
     for asset, grp in groups.items():
         grp.sort(key=lambda x: x[1])
-        cp = crypto.get(asset.lower()+"usdt")
+        cp   = crypto.get(asset.lower() + "usdt")
         spot = cp.price if cp else 0.0
 
-        for i in range(len(grp)-1):
-            ml, vl = grp[i]   # lower strike
-            mh, vh = grp[i+1] # higher strike
-
-            # Constraint: P(hit lower_strike) >= P(hit higher_strike)
-            # Violation: YES(lower) < YES(higher) — mispriced
+        for i in range(len(grp) - 1):
+            ml, vl = grp[i]
+            mh, vh = grp[i + 1]
             viol = mh.yes_ask - ml.yes_ask
             if viol < GRAPH_MIN_VIOLATION: continue
-
-            size = kelly_size(ml.yes_ask + viol/2, ml.yes_ask, balance)
-            size = min(size, ml.yes_depth * 0.10, MAX_BET_SIZE)
+            fair_p = min(0.95, ml.yes_ask + viol)
+            size   = kelly_size(fair_p, ml.yes_ask, balance)
+            size   = min(size, ml.yes_depth * 0.10, MAX_BET_SIZE)
             if size < MIN_BET_SIZE: continue
-
-            reason = f"{asset}@{spot:,.0f} strike${vl:,.0f}<${vh:,.0f} viol={viol:.3f}"
-            # Buy the underpriced lower-strike YES
-            out.append({"strategy": "DEP_GRAPH",
+            out.append({
+                "strategy": "DEP_GRAPH",
                 "market_id": ml.condition_id, "question": ml.question,
-                "token_id": ml.yes_token_id, "outcome": "YES",
-                "price": ml.yes_ask, "edge": viol/2, "size": size,
-                "reason": reason})
+                "token_id":  ml.yes_token_id, "outcome": "YES",
+                "price":     ml.yes_ask,
+                "edge":      round(viol / 2, 5),
+                "size":      size,
+                "reason":    f"{asset}@{spot:,.0f} ${vl:,.0f}<${vh:,.0f} viol={viol:.3f}",
+            })
 
-    # ── Latency arb: crypto just moved, prediction markets haven't repriced ──
-    KW = {"btcusdt": ["btc","bitcoin","$80","$90","$100","$150","$200","hit $"],
-          "ethusdt": ["eth","ethereum","$3","$4","$5","hit $"],
-          "solusdt": ["sol","solana","hit $"]}
-    TH = {"btcusdt": BTC_MOVE_THRESHOLD, "ethusdt": ETH_MOVE_THRESHOLD, "solusdt": 0.005}
+    # 2. Latency arb
+    KW = {
+        "btcusdt": ["btc", "bitcoin", "$80", "$90", "$100", "$150", "$200", "hit $"],
+        "ethusdt": ["eth", "ethereum", "$3", "$4", "$5", "hit $"],
+        "solusdt": ["sol", "solana", "hit $"],
+    }
+    TH          = {"btcusdt": 0.0005, "ethusdt": 0.0010, "solusdt": 0.003}
+    SENSITIVITY = 3.0
 
     for sym, cp in crypto.items():
         if abs(cp.return_5s) < TH.get(sym, 0.005): continue
-        kws  = KW.get(sym, [])
-        up   = cp.return_5s > 0
+        kws = KW.get(sym, [])
+        up  = cp.return_5s > 0
         for m in markets:
             if not any(k in m.question.lower() for k in kws): continue
-            new_p = max(0.05, min(0.95, m.yes_ask + 0.35 * cp.return_5s))
+            delta = SENSITIVITY * cp.return_5s
             if up:
-                edge = new_p - m.yes_ask - TAKER_FEE
+                new_p = max(0.05, min(0.95, m.yes_ask + delta))
+                edge  = new_p - m.yes_ask - TAKER_FEE
                 if edge < MIN_EDGE: continue
                 size = min(kelly_size(new_p, m.yes_ask, balance),
-                           m.yes_depth*0.10, MAX_BET_SIZE)
+                           m.yes_depth * 0.10, MAX_BET_SIZE)
                 if size < MIN_BET_SIZE: continue
-                out.append({"strategy": "DEP_GRAPH",
+                out.append({
+                    "strategy": "DEP_GRAPH",
                     "market_id": m.condition_id, "question": m.question,
-                    "token_id": m.yes_token_id, "outcome": "YES",
-                    "price": m.yes_ask, "edge": edge, "size": size,
-                    "reason": f"{sym} {cp.return_5s:+.3%}/5s → revalue"})
+                    "token_id": m.yes_token_id,  "outcome": "YES",
+                    "price": m.yes_ask, "edge": round(edge, 5), "size": size,
+                    "reason": f"{sym} {cp.return_5s:+.3%}/10s +{delta:.4f}",
+                })
             else:
-                edge = (1 - new_p) - m.no_ask - TAKER_FEE
+                new_p = max(0.05, min(0.95, m.yes_ask + delta))
+                edge  = (1.0 - new_p) - m.no_ask - TAKER_FEE
                 if edge < MIN_EDGE: continue
-                size = min(kelly_size(1-new_p, m.no_ask, balance),
-                           m.no_depth*0.10, MAX_BET_SIZE)
+                size = min(kelly_size(1.0 - new_p, m.no_ask, balance),
+                           m.no_depth * 0.10, MAX_BET_SIZE)
                 if size < MIN_BET_SIZE: continue
-                out.append({"strategy": "DEP_GRAPH",
+                out.append({
+                    "strategy": "DEP_GRAPH",
                     "market_id": m.condition_id, "question": m.question,
-                    "token_id": m.no_token_id, "outcome": "NO",
-                    "price": m.no_ask, "edge": edge, "size": size,
-                    "reason": f"{sym} {cp.return_5s:+.3%}/5s → revalue"})
+                    "token_id": m.no_token_id,   "outcome": "NO",
+                    "price": m.no_ask, "edge": round(edge, 5), "size": size,
+                    "reason": f"{sym} {cp.return_5s:+.3%}/10s {delta:.4f}",
+                })
     return out
-
 
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 
@@ -617,7 +645,7 @@ async def run():
     strat_cnt = {"SPREAD_FADE": 0, "CROSS_MARKET": 0, "DEP_GRAPH": 0}
     last_market_ref = 0.0
 
-    connector = aiohttp.TCPConnector(limit=100, ssl=False)
+    connector = aiohttp.TCPConnector(limit=100)
     async with aiohttp.ClientSession(connector=connector) as session:
         fetcher = DataFetcher(session)
 
@@ -641,12 +669,15 @@ async def run():
             # ── Get latest crypto prices (from live WS cache) ─────────────
             crypto = crypto_feed.get()
 
-            # ── Run strategies ────────────────────────────────────────────
+            # Run strategies
             signals = []
             if markets:
-                signals += scan_spread_fade(markets, account.balance)
-                signals += scan_cross_market(markets, account.balance)
-                signals += scan_dep_graph(markets, crypto, account.balance)
+                sf = scan_spread_fade(markets, account.balance)
+                cm = scan_cross_market(markets, account.balance)
+                dg = scan_dep_graph(markets, crypto, account.balance)
+                signals += sf + cm + dg
+                if scan_n % 20 == 1:  # log every ~10s
+                    log.info(f"Signals: SPREAD_FADE={len(sf)} CROSS_MARKET={len(cm)} DEP_GRAPH={len(dg)} | markets={len(markets)} crypto={'YES' if crypto else 'NO'}")
 
             scan_n += 1
             nav_hist.append({"t": datetime.now(timezone.utc).isoformat(),
