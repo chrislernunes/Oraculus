@@ -507,8 +507,11 @@ def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
         overcharge = yes_sum - 1.0
         if overcharge < CROSS_MIN_OVERCHARGE: continue
 
-        # Sort by NO ask ascending - cheapest NO = best value (longshot NOs close to 1.0)
-        grp_sorted = sorted(grp, key=lambda m: m.no_ask)
+        # Sort by neg_risk_edge descending — picks markets where yes+no is furthest
+        # below 1.0. These are longshots whose NOs are cheap AND underpriced vs fair value.
+        # Sorting by no_ask ascending was wrong: it selected expensive-NO favourites first,
+        # which always have neg_risk_edge < 0 and never clear the MIN_EDGE check.
+        grp_sorted = sorted(grp, key=lambda m: m.neg_risk_edge, reverse=True)
 
         for m in grp_sorted[:3]:
             edge = m.neg_risk_edge - TAKER_FEE
