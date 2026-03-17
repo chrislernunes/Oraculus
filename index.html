@@ -31,7 +31,7 @@ body{background:#000;color:#fff;font-family:'Share Tech Mono',monospace;font-siz
 .pvals .vd{color:#fff}
 
 /* BIG CANVAS */
-#cv-wrap{position:relative;width:100%;height:340px;background:#000;overflow:hidden;border-bottom:1px solid #1a1a1a}
+#cv-wrap{position:relative;width:100%;height:260px;background:#000;overflow:hidden;border-bottom:1px solid #1a1a1a}
 #c{display:block;width:100%;height:100%}
 .cf{position:absolute;bottom:8px;left:12px;font-size:8px;color:#fff;letter-spacing:.15em;pointer-events:none}
 .cn{position:absolute;top:10px;right:14px;text-align:right;pointer-events:none}
@@ -102,7 +102,7 @@ body{background:#000;color:#fff;font-family:'Share Tech Mono',monospace;font-siz
 
 <!-- HEADER -->
 <div id="hdr">
-  <div id="htl">ORACULUS</div>
+  <div id="htl">ORACULUS // ARB ENGINE</div>
   <div id="htr">
     <span>SCAN <span id="hs">0</span></span>
     <span id="hbtc">BTC $—</span>
@@ -167,14 +167,14 @@ body{background:#000;color:#fff;font-family:'Share Tech Mono',monospace;font-siz
         <tr><td>Total Trades</td><td id="mt">0</td></tr>
         <tr><td>Sharpe</td><td id="ms">0.00</td></tr>
         <tr><td>Max DD</td><td id="md">0.0%</td></tr>
-        <tr><td>Strategy</td><td>Poly Arb</td></tr>
+        <tr><td>Strategy</td><td>3-Strategy Arb</td></tr>
         <tr><td>Orders</td><td>Limit Only</td></tr>
         <tr><td>Hedge</td><td>Directional</td></tr>
       </table>
       <div id="stat">
         <div style="font-size:7px;color:#fff;text-transform:uppercase;letter-spacing:.2em;margin-bottom:5px">STATUS</div>
-        <div class="sr"><span class="sn">Polymarket</span><span class="sv-on">ONLINE</span></div>
-        <div class="sr"><span class="sn">Binance</span><span class="sv-on" id="ss-bin">ONLINE</span></div>
+        <div class="sr"><span class="sn">Gamma API</span><span class="sv-on">ONLINE</span></div>
+        <div class="sr"><span class="sn">CoinGecko</span><span class="sv-on" id="ss-bin">ONLINE</span></div>
         <div class="sr"><span class="sn">Bayes</span><span class="sv-on">ONLINE</span></div>
         <div class="sr"><span class="sn">Kelly</span><span class="sv-on">ONLINE</span></div>
         <div class="sr"><span class="sn">Slippage</span><span class="sv-act">ACTIVE</span></div>
@@ -210,14 +210,14 @@ body{background:#000;color:#fff;font-family:'Share Tech Mono',monospace;font-siz
 <div id="ftr">
   <div>ORACULUS · <span id="ftm"></span> UTC <span class="blink">_</span></div>
   <div id="fmid">SCAN #0 · 0 MARKETS · NAV $0 · P&L $+0.00</div>
-  <div>REFRESH 0.5S · WS <span id="fws">—</span> · PAPER · <span id="ftrd">0</span> TRADES</div>
+  <div>REFRESH 2S · PAPER ACCOUNT · <span id="ftrd">0</span> TRADES</div>
 </div>
 
 <script>
 // ── Canvas ────────────────────────────────────────────────────────────────────
 var cv=document.getElementById('c'),ctx=cv.getContext('2d'),W,H,rays=[],t=0;
 function initC(){
-  W=cv.parentElement.offsetWidth; H=340; cv.width=W; cv.height=H;
+  W=cv.parentElement.offsetWidth; H=260; cv.width=W; cv.height=H;
   var cx=W*.07, cy=H*.5; rays=[];
   for(var i=0;i<180;i++){
     var a=(i/180-.5)*1.65, len=(.36+(i%13)*.05)*W;
@@ -285,7 +285,7 @@ function mkT(hs,rows){
   var tr=rows.map(r=>'<tr>'+r.map(c=>`<td>${c}</td>`).join('')+'</tr>').join('');
   return`<div style="overflow-x:auto;max-height:380px;overflow-y:auto"><table class="dt"><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table></div>`;
 }
-var SICON={SPREAD_FADE:'[FADE]',CROSS_MARKET:'[XMKT]',DEP_GRAPH:'[DEP]',NEG_RISK_ARB:'[ARB]',LATENCY_ARB:'[LAT]',MARKET_MAKING:'[MM]'};
+var SICON={SPREAD_FADE:'[SPD]',CROSS_MARKET:'[CRS]',DEP_GRAPH:'[DEP]'};
 var SB=1000, logBuf=[];
 
 // ── Update UI ─────────────────────────────────────────────────────────────────
@@ -295,29 +295,21 @@ function upd(s){
   var pct=(nav-SB)/SB*100, trades=s.num_trades||0, wr=s.win_rate||0;
   var signals=s.signals||[], markets=s.markets||[], crypto=s.crypto||{};
   var tlist=s.trades||[], sc=s.strat_counts||{};
-  var btc=(crypto.btcusdt||{}), eth=(crypto.ethusdt||{});
-  var btcP=btc.price||0, ethP=eth.price||0;
-  var btc24=btc.change_24h||0, eth24=eth.change_24h||0;
-  var edgeTop=s.edge_top||Math.max(0,...signals.map(sg=>sg.edge||0));
-  var post=Math.min(.95,.5+.04*Math.min((sc.SPREAD_FADE||0)+(sc.CROSS_MARKET||0)+(sc.DEP_GRAPH||0),10));
+  var btc=(crypto.btcusdt||{}).price||0;
+  var eth=(crypto.ethusdt||{}).price||0;
+  var edgeTop=Math.max(0,...markets.map(m=>m.neg_risk_edge||0));
+  var post=Math.min(.95,.5+.04*Math.min((sc.SPREAD_FADE||0)+(sc.DEP_GRAPH||0)+(sc.CROSS_MARKET||0),10));
   var evNet=signals.length?(signals[0].edge||0)-.002:-.002;
   var qMc=Math.min(.95,post), f0=Math.max(0,(qMc-(1-qMc))/Math.max(qMc,.01));
-  var tHr=Math.round(trades/Math.max(scans*0.5/3600,.01));
+  var tHr=Math.round(trades/Math.max(scans*2/3600,.01));
   var sharpe=Math.abs(Math.round(pct/Math.max(Math.abs(rpnl/Math.max(nav,1)*100),.1)*.4*100)/100);
   var maxDD=Math.abs(Math.min(0,rpnl)/Math.max(nav,1)*100);
-  var totalE=signals.slice(0,10).reduce((a,sg)=>a+(sg.edge||0),0)*100;
+  var totalE=signals.slice(0,10).reduce((a,s)=>a+(s.edge||0),0)*100;
 
   // Header
   document.getElementById('hs').textContent=scans;
-  var btcStr=btcP?'BTC $'+btcP.toLocaleString('en-US',{maximumFractionDigits:0})+' '+(btc24>=0?'▲':'▽')+Math.abs(btc24).toFixed(1)+'%':'BTC $—';
-  var ethStr=ethP?'ETH $'+ethP.toLocaleString('en-US',{maximumFractionDigits:0})+' '+(eth24>=0?'▲':'▽')+Math.abs(eth24).toFixed(1)+'%':'ETH $—';
-  document.getElementById('hbtc').textContent=btcStr;
-  document.getElementById('hbtc').style.color=btc24>=0?'#4ec97a':'#cc5555';
-  document.getElementById('heth').textContent=ethStr;
-  document.getElementById('heth').style.color=eth24>=0?'#4ec97a':'#cc5555';
-  var wsOk=s.ws_connected||false;
-  document.getElementById('fws').textContent=wsOk?'LIVE':'REST';
-  document.getElementById('fws').style.color=wsOk?'#4ec97a':'#e0c040';
+  document.getElementById('hbtc').textContent=btc?'BTC $'+btc.toLocaleString('en-US',{maximumFractionDigits:0}):'BTC $—';
+  document.getElementById('heth').textContent=eth?'ETH $'+eth.toLocaleString('en-US',{maximumFractionDigits:0}):'ETH $—';
   document.getElementById('hedg').textContent='EDGE '+(edgeTop>0?(edgeTop*100).toFixed(2)+'%':'—');
   var lb=document.getElementById('hlv');
   lb.textContent=alive?'LIVE':'OFFLINE'; lb.className=alive?'badge-live':'badge-off';
@@ -394,23 +386,21 @@ function upd(s){
   // Scanner
   var abv=markets.filter(m=>m.neg_risk_edge>.003).length;
   document.getElementById('ss2').textContent=`${mkts} MARKETS LIVE // ${abv} WITH POSITIVE EDGE // BEST ${edgeTop>0?'+':''+(edgeTop).toFixed(4)} // SORTED BY EDGE`;
-  var mr2=markets.slice(0,150).map(m=>{
+  var mr2=markets.slice(0,100).map(m=>{
     var e=m.neg_risk_edge||0;
-    var ec=e>.005?'color:#4ec97a;font-weight:600':e>.002?'color:#88cc88':e<-.005?'color:#553333':e<-.001?'color:#664444':'color:#aaa';
-    var spread=((m.yes_price||0)-(m.yes_bid||0));
-    var sc2=spread<0.01?'color:#4ec97a':spread<0.03?'color:#e0c040':'color:#cc5555';
+    var ec=e>.005?'color:#4ec97a;font-weight:600':e>.001?'color:#88cc88':e<-.001?'color:#664444':'color:#fff';
+    var yc=m.yes_price>.6?'color:#fff':m.yes_price<.15?'color:#fff':'color:#fff';
     return[
-      `<span style="color:#e8e8e8">${(m.question||'').slice(0,62)}</span>`,
-      `<span style="color:#fff">${(m.yes_bid||0).toFixed(3)}/<span style="color:#aaa">${(m.yes_price||0).toFixed(3)}</span></span>`,
-      `<span style="color:#fff">${(m.no_bid||0).toFixed(3)}/<span style="color:#aaa">${(m.no_price||0).toFixed(3)}</span></span>`,
-      `<span style="color:#aaa">${((m.yes_price||0)+(m.no_price||0)).toFixed(4)}</span>`,
+      `<span style="color:#fff">${(m.question||'').slice(0,65)}</span>`,
+      `<span style="${yc}">${(m.yes_price||0).toFixed(4)}</span>`,
+      `<span style="color:#fff">${(m.no_price||0).toFixed(4)}</span>`,
+      `<span style="color:#fff">${((m.yes_price||0)+(m.no_price||0)).toFixed(4)}</span>`,
       `<span style="${ec}">${(e>=0?'+':'')+e.toFixed(4)}</span>`,
-      `<span style="${sc2}">${spread.toFixed(3)}</span>`,
       `<span style="color:#fff">$${(m.yes_depth||0).toFixed(0)}</span>`,
     ];
   });
   document.getElementById('st2').innerHTML=mr2.length
-    ?mkT(['MARKET','YES BID/ASK','NO BID/ASK','SUM','EDGE','SPREAD','DEPTH'],mr2)
+    ?mkT(['MARKET','YES','NO','SUM','ARB EDGE','DEPTH'],mr2)
     :'<div style="padding:20px;text-align:center;color:#fff">LOADING MARKETS...</div>';
 
   // Trades
@@ -460,13 +450,13 @@ function upd(s){
   document.getElementById('ftrd').textContent=trades;
 }
 
-// ── Poll /api/state every 500ms ──────────────────────────────────────────────
+// ── Poll /api/state every 2s ──────────────────────────────────────────────────
 async function poll(){
   try{
     var r=await fetch('/api/state');
     if(r.ok){ var s=await r.json(); upd(s); }
   }catch(e){ console.warn('poll',e); }
-  setTimeout(poll,500);
+  setTimeout(poll,2000);
 }
 poll();
 </script>
