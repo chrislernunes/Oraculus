@@ -1,6 +1,6 @@
 """
 Oraculus — Trading Engine v3
-Real-time crypto via Binance bookTicker WebSocket stream.
+Crypto prices via CoinGecko REST API (polled every 10s).
 Three live strategies: SPREAD_FADE, CROSS_MARKET, DEP_GRAPH.
 """
 
@@ -72,7 +72,7 @@ def load_json(path: str) -> dict:
         return {}
 
 
-# ── Crypto Feed (Binance WebSocket — zero latency) ────────────────────────────
+# ── Crypto Feed (CoinGecko REST — polled every 10s) ──────────────────────────
 
 class CryptoFeed:
     """
@@ -95,8 +95,8 @@ class CryptoFeed:
         "ethereum": "ethusdt",
         "solana": "solusdt",
     }
-    COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
-    REST_POLL_SEC = 10   # 6 calls/min — well within free tier 30/min limit
+    COINGECKO_URL = f"{COINGECKO_API}/simple/price"
+    REST_POLL_SEC = CRYPTO_POLL_SEC
 
     # Typical bid-ask spreads as a fraction of mid-price (used to synthesise bid/ask)
     SPREAD_EST = {"btcusdt": 0.0002, "ethusdt": 0.0003, "solusdt": 0.0008}
