@@ -5,9 +5,9 @@ Three live strategies: SPREAD_FADE, CROSS_MARKET, DEP_GRAPH.
 """
 
 from __future__ import annotations
-import asyncio, json, logging, re, time
+import asyncio, json, logging, re, time, random
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
@@ -120,8 +120,12 @@ class CryptoFeed:
         now  = time.time()
         hist = self._hist.setdefault(sym, [])
         hist.append((now, price))
-        self._hist[sym] = [(t, p) for t, p in hist if t > now - 30]
-        old = [p for t, p in self._hist[sym] if t <= now - 5]
+        self._hist[sym] = [(t, p) for t, p in hist if t > now - 60]  # keep 60s
+        # Use entries from 10-20s ago to compute return — matches poll cadence
+        old = [p for t, p in self._hist[sym] if now - 20 <= now - t <= now - 8]
+        if not old:
+            # fallback: any entry older than 8s
+            old = [p for t, p in self._hist[sym] if t <= now - 8]
         ret5 = (price - old[-1]) / old[-1] if old and old[-1] > 0 else 0.0
         self._prices[sym] = CryptoPrice(sym, round(price, 2), bid, ask, ret5, change_24h)
 
@@ -178,37 +182,160 @@ class CryptoFeed:
 
 # ── Data Fetcher ──────────────────────────────────────────────────────────────
 
-class DataFetcher:
-    def __init__(self, session: aiohttp.ClientSession):
-        self._s = session
+class RateLimiter:
+    """
+    Token-bucket rate limiter for a single endpoint.
+    Blocks callers until a token is available.
+    """
+    def __init__(self, rate_per_sec: float):
+        self._rate   = rate_per_sec          # tokens added per second
+        self._tokens = rate_per_sec          # start full
+        self._last   = time.monotonic()
+        self._lock   = asyncio.Lock()
 
-    async def _get(self, url, params=None, timeout=15):
-        try:
-            async with self._s.get(url, params=params,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-                headers={"Accept": "application/json"}) as r:
-                if r.status == 200:
-                    return await r.json(content_type=None)
-                log.debug(f"GET {url} → {r.status}")
-        except Exception as e:
-            log.debug(f"GET {url}: {e}")
+    async def acquire(self):
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last
+            self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
+            self._last = now
+            if self._tokens >= 1:
+                self._tokens -= 1
+                return
+            # Need to wait for next token
+            wait = (1 - self._tokens) / self._rate
+            self._tokens = 0
+        await asyncio.sleep(wait)
+
+
+class DataFetcher:
+    """
+    Rate-limit-aware market data fetcher.
+
+    Rate limits observed / documented:
+      Gamma /markets    : ~10 req/min safe  → we call once per 25s = 2.4/min ✅
+      CLOB  /book       : ~120 req/min safe → we throttle to 2 req/s = 120/min ✅
+      CLOB  /book burst : semaphore=8       → max 8 in-flight at once, with jitter
+
+    Strategies:
+      1. Token-bucket rate limiter (2 req/s) on CLOB orderbook calls.
+      2. Semaphore(8) limits in-flight concurrent requests.
+      3. Random jitter (0-200ms) staggers requests in each batch.
+      4. Exponential backoff with jitter on 429/5xx (up to 4 retries).
+      5. Per-token book cache: unchanged books reused across refresh cycles.
+         Only re-fetches a book if it wasn't cached or cache is >60s old.
+      6. Priority queue: high-volume markets fetched first; tail end dropped
+         gracefully if rate limit is hit.
+    """
+
+    # CLOB: 5 requests/sec sustained = 300/min, under ~400/min Polymarket limit
+    # With semaphore=10 and jitter, actual burst is well-controlled
+    CLOB_RATE_PER_SEC = 5.0
+    # Max in-flight concurrent CLOB requests
+    CLOB_CONCURRENCY  = 10
+    # Max markets to fetch books for per cycle (400 token IDs = 80s at 5/s)
+    MAX_CLOB_MARKETS  = 200
+    # Book cache TTL in seconds — reuse cached books younger than this
+    BOOK_CACHE_TTL    = 90
+
+    def __init__(self, session: aiohttp.ClientSession):
+        self._s          = session
+        self._clob_rl    = RateLimiter(self.CLOB_RATE_PER_SEC)
+        self._sem        = asyncio.Semaphore(self.CLOB_CONCURRENCY)
+        # book_cache: token_id → {"data": dict, "ts": float}
+        self._book_cache: Dict[str, dict] = {}
+
+    # ── Generic GET with exponential backoff ─────────────────────────────────
+
+    async def _get(self, url: str, params=None, timeout: int = 15,
+                   retries: int = 3, label: str = "") -> Optional[dict]:
+        """
+        GET with retry + exponential backoff. Handles 429 and 5xx.
+        """
+        for attempt in range(retries + 1):
+            try:
+                async with self._s.get(
+                    url, params=params,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    headers={"Accept": "application/json"}
+                ) as r:
+                    if r.status == 200:
+                        return await r.json(content_type=None)
+                    if r.status == 429:
+                        wait = (2 ** attempt) * 5 + random.uniform(0, 2)
+                        log.warning(f"Rate limit (429) on {label or url[-40:]} "
+                                    f"— backoff {wait:.1f}s (attempt {attempt+1})")
+                        await asyncio.sleep(wait)
+                        continue
+                    if r.status >= 500:
+                        wait = (2 ** attempt) * 2 + random.uniform(0, 1)
+                        log.warning(f"Server error {r.status} on {label or url[-40:]} "
+                                    f"— backoff {wait:.1f}s")
+                        await asyncio.sleep(wait)
+                        continue
+                    log.debug(f"GET {url[-60:]} → {r.status}")
+                    return None
+            except asyncio.TimeoutError:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                log.debug(f"Timeout on {label or url[-40:]} — backoff {wait:.1f}s")
+                await asyncio.sleep(wait)
+            except Exception as e:
+                log.debug(f"GET {url[-60:]}: {e}")
+                return None
+        log.debug(f"Gave up on {label or url[-40:]} after {retries+1} attempts")
         return None
 
+    # ── CLOB book fetch with rate limiting + cache ────────────────────────────
+
+    async def _fetch_book(self, tid: str) -> Optional[dict]:
+        """
+        Fetch one CLOB orderbook. Checks cache first. Applies rate limiting + jitter.
+        """
+        # Cache hit — reuse if fresh enough
+        cached = self._book_cache.get(tid)
+        if cached and (time.time() - cached["ts"]) < self.BOOK_CACHE_TTL:
+            return cached["data"]
+
+        # Jitter: spread requests in time (0–200ms per slot)
+        await asyncio.sleep(random.uniform(0, 0.2))
+
+        async with self._sem:
+            await self._clob_rl.acquire()
+            data = await self._get(
+                f"{POLYMARKET_CLOB}/book",
+                params={"token_id": tid},
+                timeout=8,
+                retries=2,
+                label=f"CLOB/book/{tid[:12]}"
+            )
+
+        if data is not None:
+            self._book_cache[tid] = {"data": data, "ts": time.time()}
+        return data
+
+    # ── Market fetch ─────────────────────────────────────────────────────────
+
     async def fetch_markets(self) -> List[MarketData]:
-        # Step 1: Gamma market list
-        raw = await self._get(f"{POLYMARKET_GAMMA}/markets",
-            params={"active": "true", "closed": "false", "limit": 500})
+        # ── Step 1: Gamma market list ─────────────────────────────────────────
+        raw = await self._get(
+            f"{POLYMARKET_GAMMA}/markets",
+            params={"active": "true", "closed": "false", "limit": 500},
+            retries=2, label="Gamma/markets"
+        )
         items = raw if isinstance(raw, list) else (raw or {}).get("markets", []) if raw else []
         if not items:
-            raw = await self._get(f"{POLYMARKET_GAMMA}/markets",
-                params={"active": "true", "limit": 300})
+            raw = await self._get(
+                f"{POLYMARKET_GAMMA}/markets",
+                params={"active": "true", "limit": 300},
+                retries=2, label="Gamma/markets-fallback"
+            )
             items = raw if isinstance(raw, list) else (raw or {}).get("markets", []) if raw else []
         if not items:
             log.error("No markets from Gamma")
             return []
         log.info(f"Gamma: {len(items)} markets")
 
-        # Step 2: Parse token pairs
+        # ── Step 2: Parse token pairs, sorted by volume (high volume first) ──
         token_pairs = []
         gamma_map   = {}
         for m in items:
@@ -235,24 +362,44 @@ class DataFetcher:
             if len(ids) >= 2 and ids[0] and ids[1]:
                 token_pairs.append((cid, str(ids[0]), str(ids[1]), q, cat, vol))
 
-        log.info(f"Token pairs: {len(token_pairs)}")
+        # Sort by volume descending — fetch the most liquid markets first.
+        # If we hit rate limits, we drop the tail (illiquid markets), not the head.
+        token_pairs.sort(key=lambda x: x[5], reverse=True)
+        token_pairs = token_pairs[:self.MAX_CLOB_MARKETS]
+        log.info(f"Token pairs: {len(token_pairs)} (top {self.MAX_CLOB_MARKETS} by volume)")
         if not token_pairs: return []
 
-        # Step 3: Parallel CLOB orderbook fetch (80 concurrent)
-        book_cache: Dict[str, dict] = {}
-        sem = asyncio.Semaphore(80)
+        # ── Step 3: Rate-limited CLOB orderbook fetch ─────────────────────────
+        # Deduplicate token IDs, preserving volume-priority order
+        seen_tids: set = set()
+        ordered_tids: List[str] = []
+        for _, yid, nid, *_ in token_pairs:
+            for tid in (yid, nid):
+                if tid not in seen_tids:
+                    seen_tids.add(tid)
+                    ordered_tids.append(tid)
 
-        async def fetch_book(tid: str):
-            async with sem:
-                b = await self._get(f"{POLYMARKET_CLOB}/book",
-                    params={"token_id": tid}, timeout=8)
-                if b: book_cache[tid] = b
+        book_cache: Dict[str, Optional[dict]] = {}
 
-        all_tids = list({tid for _,y,n,_,_,_ in token_pairs[:500] for tid in [y,n]})
-        await asyncio.gather(*[fetch_book(tid) for tid in all_tids])
-        log.info(f"CLOB orderbooks: {len(book_cache)}")
+        # Fetch in parallel but gated by semaphore + rate limiter
+        tasks = [self._fetch_book(tid) for tid in ordered_tids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for tid, res in zip(ordered_tids, results):
+            if isinstance(res, Exception):
+                log.debug(f"Book fetch exception {tid[:12]}: {res}")
+                book_cache[tid] = None
+            else:
+                book_cache[tid] = res
 
-        # Step 4: Build MarketData
+        filled = sum(1 for v in book_cache.values() if v)
+        cached = sum(1 for tid in ordered_tids
+                     if tid in self._book_cache
+                     and (time.time() - self._book_cache[tid]["ts"]) < self.BOOK_CACHE_TTL
+                     and book_cache.get(tid) is not None)
+        log.info(f"CLOB orderbooks: {filled}/{len(ordered_tids)} "
+                 f"({cached} from cache, {filled-cached} fresh)")
+
+        # ── Step 4: Build MarketData ──────────────────────────────────────────
         result = []
         for cid, yid, nid, q, cat, vol in token_pairs:
             ybook = book_cache.get(yid)
@@ -262,25 +409,24 @@ class DataFetcher:
             yes_depth = no_depth = 0.0
 
             if ybook:
-                asks = sorted(ybook.get("asks",[]), key=lambda x: float(x.get("price",999)))
-                bids = sorted(ybook.get("bids",[]), key=lambda x: float(x.get("price",0)), reverse=True)
-                if asks: yes_ask = float(asks[0].get("price",0))
-                if bids: yes_bid = float(bids[0].get("price",0))
-                # depth = sum of SIZE (shares) at best 5 ask levels — not price*size
-                yes_depth = sum(float(a.get("size",0)) for a in asks[:5])
+                asks = sorted(ybook.get("asks", []), key=lambda x: float(x.get("price", 999)))
+                bids = sorted(ybook.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
+                if asks: yes_ask = float(asks[0].get("price", 0))
+                if bids: yes_bid = float(bids[0].get("price", 0))
+                yes_depth = sum(float(a.get("size", 0)) for a in asks[:5])
 
             if nbook:
-                asks = sorted(nbook.get("asks",[]), key=lambda x: float(x.get("price",999)))
-                bids = sorted(nbook.get("bids",[]), key=lambda x: float(x.get("price",0)), reverse=True)
-                if asks: no_ask = float(asks[0].get("price",0))
-                if bids: no_bid = float(bids[0].get("price",0))
-                no_depth = sum(float(a.get("size",0)) for a in asks[:5])
+                asks = sorted(nbook.get("asks", []), key=lambda x: float(x.get("price", 999)))
+                bids = sorted(nbook.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
+                if asks: no_ask = float(asks[0].get("price", 0))
+                if bids: no_bid = float(bids[0].get("price", 0))
+                no_depth = sum(float(a.get("size", 0)) for a in asks[:5])
 
             # Gamma mid fallback — used when CLOB book is missing
             if not yes_ask or not no_ask:
                 m_raw = gamma_map.get(cid, {})
-                op = m_raw.get("outcomePrices","[]")
-                if isinstance(op,str):
+                op = m_raw.get("outcomePrices", "[]")
+                if isinstance(op, str):
                     try: op = json.loads(op)
                     except: op = []
                 if len(op) >= 2:
@@ -290,8 +436,6 @@ class DataFetcher:
                         no_bid  = max(0.01, no_ask  - 0.02)
                     except: pass
 
-            # For Gamma-fallback markets with no CLOB depth, assign a conservative
-            # minimum so strategies can still evaluate them (capped bet size handles risk)
             if yes_depth == 0.0: yes_depth = MIN_DEPTH
             if no_depth  == 0.0: no_depth  = MIN_DEPTH
 
@@ -304,6 +448,7 @@ class DataFetcher:
 
         log.info(f"Built {len(result)} markets")
         return result
+
 
 
 # ── Paper Account ─────────────────────────────────────────────────────────────
@@ -401,22 +546,29 @@ def scan_spread_fade(markets: List[MarketData], balance: float) -> List[dict]:
     SPREAD_FADE: Exploit bid-ask spread mispricing.
 
     Case 1 - Long NO on very unlikely events:
-      YES_ask < 0.08  ->  true NO prob ~= 1 - YES_mid ~= 0.94+
+      YES_ask < 0.12  ->  true NO prob ~= 1 - YES_mid ~= 0.90+
       Buy NO at no_ask if edge = (1 - yes_mid) - no_ask - fee > MIN_EDGE
 
     Case 2 - Long YES on near-certain events:
-      YES_mid > 0.92  ->  true YES prob ~= 1 - NO_mid ~= 0.94+
+      YES_mid > 0.92  ->  true YES prob ~= 1 - NO_mid ~= 0.92+
       Buy YES at yes_ask if edge = (1 - no_mid) - yes_ask - fee > MIN_EDGE
+
+    Note: on real CLOB markets bids are often absent (0.0), so _mid() falls
+    back to the ask. This means yes_mid = yes_ask and the edge condition
+    reduces to: no_ask < (1 - yes_ask) - fee. We use a lower per-strategy
+    MIN_EDGE of 0.002 to catch real-market spreads that are tighter than
+    the global 0.4% threshold.
     """
+    SF_MIN_EDGE = 0.002   # lower threshold for this strategy on real markets
     out = []
     for m in markets:
 
         # Case 1: Long NO on very unlikely events
-        if 0.01 < m.yes_ask < 0.08:
+        if 0.01 < m.yes_ask < 0.12:
             yes_mid    = _mid(m.yes_ask, m.yes_bid)
             implied_no = 1.0 - yes_mid
             edge       = implied_no - m.no_ask - TAKER_FEE
-            if edge >= MIN_EDGE and m.no_depth >= MIN_DEPTH:
+            if edge >= SF_MIN_EDGE and m.no_depth >= MIN_DEPTH:
                 size = min(kelly_size(implied_no, m.no_ask, balance), m.no_depth * 0.10)
                 if size >= MIN_BET_SIZE:
                     out.append({
@@ -433,11 +585,11 @@ def scan_spread_fade(markets: List[MarketData], balance: float) -> List[dict]:
 
         # Case 2: Long YES on near-certain events (filter on mid, not ask)
         yes_mid = _mid(m.yes_ask, m.yes_bid)
-        if 0.92 < yes_mid < 0.988:
+        if 0.90 < yes_mid < 0.990:
             no_mid      = _mid(m.no_ask, m.no_bid)
             implied_yes = 1.0 - no_mid
             edge        = implied_yes - m.yes_ask - TAKER_FEE
-            if edge >= MIN_EDGE and m.yes_depth >= MIN_DEPTH:
+            if edge >= SF_MIN_EDGE and m.yes_depth >= MIN_DEPTH:
                 size = min(kelly_size(implied_yes, m.yes_ask, balance), m.yes_depth * 0.10)
                 if size >= MIN_BET_SIZE:
                     out.append({
@@ -457,38 +609,63 @@ def scan_spread_fade(markets: List[MarketData], balance: float) -> List[dict]:
 def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
     """
     CROSS_MARKET: Mutually-exclusive groups where sum(YES_asks) > 1.0.
-    Buy NO on the cheapest NO contracts (best risk/reward - longshot NOs near 1.0).
-    Edge = neg_risk_edge of that specific market minus fee (not group-averaged).
-    Requires >= 4 members to confirm it's a real group, not noise.
+    Buy NO on markets with the highest neg_risk_edge (most underpriced NO).
+    Edge = neg_risk_edge of that specific market minus fee.
+    Min group size 3 — real Polymarket often has 3-team groups (conf finals, 3-nominee awards).
     """
+    CM_MIN_EDGE = 0.002   # lower than global MIN_EDGE — cross-market edges are structural
     out = []
 
     def topic_key(q: str) -> Optional[str]:
         q = q.lower()
         checks = [
-            (["nhl", "stanley cup"],                    "NHL_CUP"),
+            # Basketball
             (["nba", "finals"],                         "NBA_FINALS"),
             (["nba", "eastern conference"],             "NBA_EAST_CONF"),
             (["nba", "western conference"],             "NBA_WEST_CONF"),
+            (["nba", "championship"],                   "NBA_CHAMP"),
             (["nba", "mvp"],                            "NBA_MVP"),
-            (["masters", "golf"],                       "MASTERS"),
-            (["fifa", "world cup"],                     "FIFA_WC"),
+            # Hockey
+            (["nhl", "stanley cup"],                    "NHL_CUP"),
+            (["nhl", "mvp"],                            "NHL_MVP"),
+            # Soccer
             (["champions league", "win"],               "UCL"),
+            (["champions league", "title"],             "UCL"),
             (["premier league", "win"],                 "EPL"),
+            (["premier league", "title"],               "EPL"),
             (["la liga", "win"],                        "LALIGA"),
             (["serie a", "win"],                        "SERIEA"),
             (["bundesliga", "win"],                     "BUNDESLIGA"),
-            (["presidential", "republican nomination"], "GOP_NOM"),
-            (["presidential", "democratic nomination"], "DEM_NOM"),
-            (["presidential", "win", "2028"],           "PRES_2028"),
-            (["next james bond"],                       "BOND"),
-            (["next pope"],                             "POPE"),
+            (["world cup", "win"],                      "WORLD_CUP"),
+            (["world cup", "champion"],                 "WORLD_CUP"),
+            # American sports
             (["super bowl", "win"],                     "SUPERBOWL"),
+            (["super bowl", "champion"],                "SUPERBOWL"),
             (["world series", "win"],                   "WORLD_SERIES"),
+            (["nfl", "mvp"],                            "NFL_MVP"),
+            (["masters", "golf"],                       "MASTERS"),
+            (["us open", "golf"],                       "US_OPEN_GOLF"),
+            # Awards
             (["oscar", "best picture"],                 "OSCAR_PICTURE"),
             (["oscar", "best director"],                "OSCAR_DIRECTOR"),
-            (["emmy", "best"],                          "EMMY"),
+            (["oscar", "best actor"],                   "OSCAR_ACTOR"),
+            (["oscar", "best actress"],                 "OSCAR_ACTRESS"),
+            (["emmy", "best drama"],                    "EMMY_DRAMA"),
+            (["emmy", "best comedy"],                   "EMMY_COMEDY"),
+            (["grammy", "album of the year"],           "GRAMMY_AOTY"),
             (["nobel", "prize"],                        "NOBEL"),
+            # Politics
+            (["presidential", "republican nomination"], "GOP_NOM"),
+            (["presidential", "democratic nomination"], "DEM_NOM"),
+            (["republican", "nominee"],                 "GOP_NOM"),
+            (["democratic", "nominee"],                 "DEM_NOM"),
+            (["presidential", "win", "2028"],           "PRES_2028"),
+            (["president", "2028"],                     "PRES_2028"),
+            # Pop culture
+            (["next james bond"],                       "BOND"),
+            (["james bond"],                            "BOND"),
+            (["next pope"],                             "POPE"),
+            (["pope"],                                  "POPE"),
         ]
         for kws, key in checks:
             if all(k in q for k in kws):
@@ -502,20 +679,19 @@ def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
             groups.setdefault(k, []).append(m)
 
     for group_name, grp in groups.items():
-        if len(grp) < 4: continue
+        if len(grp) < 3: continue        # lowered from 4 — real groups often have 3 members
         yes_sum    = sum(m.yes_ask for m in grp)
         overcharge = yes_sum - 1.0
         if overcharge < CROSS_MIN_OVERCHARGE: continue
 
         # Sort by neg_risk_edge descending — picks markets where yes+no is furthest
-        # below 1.0. These are longshots whose NOs are cheap AND underpriced vs fair value.
-        # Sorting by no_ask ascending was wrong: it selected expensive-NO favourites first,
-        # which always have neg_risk_edge < 0 and never clear the MIN_EDGE check.
+        # below 1.0 (longshots with underpriced NOs). Do NOT sort by no_ask ascending —
+        # that selects expensive-NO favourites whose neg_risk_edge is negative.
         grp_sorted = sorted(grp, key=lambda m: m.neg_risk_edge, reverse=True)
 
         for m in grp_sorted[:3]:
             edge = m.neg_risk_edge - TAKER_FEE
-            if edge < MIN_EDGE: continue
+            if edge < CM_MIN_EDGE: continue
             if m.no_depth < MIN_DEPTH: continue
             implied_no = 1.0 - m.yes_ask
             size = min(kelly_size(implied_no, m.no_ask, balance),
@@ -647,29 +823,38 @@ async def run():
     scan_n    = 0
     strat_cnt = {"SPREAD_FADE": 0, "CROSS_MARKET": 0, "DEP_GRAPH": 0}
     last_market_ref = 0.0
+    refresh_task    = None   # background market refresh task
 
     connector = aiohttp.TCPConnector(limit=100)
     async with aiohttp.ClientSession(connector=connector) as session:
         fetcher = DataFetcher(session)
 
-        # Start live crypto WebSocket feed as background task
         crypto_feed = CryptoFeed()
         crypto_feed.set_session(session)
         asyncio.create_task(crypto_feed.run_forever())
 
+        async def do_refresh():
+            """Background market refresh — never blocks the scan loop."""
+            nonlocal markets, last_market_ref
+            log.info("Refreshing markets (background)...")
+            try:
+                fresh = await fetcher.fetch_markets()
+                if fresh:
+                    markets = fresh
+                last_market_ref = time.time()
+            except Exception as e:
+                log.error(f"Market refresh error: {e}")
+
         while True:
             now = time.time()
 
-            # ── Market refresh (every MARKET_REFRESH_SEC) ─────────────────
+            # Kick off background refresh without awaiting — scan loop keeps running
             if now - last_market_ref > MARKET_REFRESH_SEC:
-                log.info("Refreshing markets...")
-                try:
-                    markets = await fetcher.fetch_markets()
-                    last_market_ref = time.time()
-                except Exception as e:
-                    log.error(f"Market refresh error: {e}")
+                if refresh_task is None or refresh_task.done():
+                    refresh_task = asyncio.create_task(do_refresh())
+                    last_market_ref = now  # prevent re-triggering immediately
 
-            # ── Get latest crypto prices (from live WS cache) ─────────────
+            # ── Get latest crypto prices (from CoinGecko poll cache) ──────────
             crypto = crypto_feed.get()
 
             # Run strategies
@@ -680,7 +865,12 @@ async def run():
                 dg = scan_dep_graph(markets, crypto, account.balance)
                 signals += sf + cm + dg
                 if scan_n % 20 == 1:  # log every ~10s
-                    log.info(f"Signals: SPREAD_FADE={len(sf)} CROSS_MARKET={len(cm)} DEP_GRAPH={len(dg)} | markets={len(markets)} crypto={'YES' if crypto else 'NO'}")
+                    btc_ret = crypto.get("btcusdt", CryptoPrice("btcusdt",0)).return_5s
+                    log.info(
+                        f"Signals: SF={len(sf)} CM={len(cm)} DG={len(dg)} "
+                        f"| mkts={len(markets)} held={len(account.positions)} "
+                        f"bal=${account.balance:.0f} btc_ret={btc_ret:+.4f}"
+                    )
 
             scan_n += 1
             nav_hist.append({"t": datetime.now(timezone.utc).isoformat(),
@@ -688,6 +878,17 @@ async def run():
             if len(nav_hist) > 500: nav_hist = nav_hist[-500:]
 
             # Deduplicate + sort by edge
+            # Evict positions older than 48 h — they've almost certainly resolved
+            # on-chain and shouldn't keep blocking fresh signals on the same market.
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+            stale = [k for k, p in account.positions.items()
+                     if datetime.fromisoformat(
+                         p.get("opened_at", "2000-01-01T00:00:00+00:00")
+                         .replace("Z", "+00:00")) < cutoff]
+            for k in stale:
+                del account.positions[k]
+                log.info(f"Evicted stale position {k[:20]}...")
+
             held = set(account.positions.keys())
             seen = set(); clean = []
             for sig in sorted(signals, key=lambda x: x["edge"], reverse=True):
@@ -715,15 +916,36 @@ async def run():
             eth = crypto.get("ethusdt")
             edge_top = max((s["edge"] for s in all_sigs[:10]), default=0.0)
 
+            # Mark-to-market: estimate unrealized PnL using current market prices
+            # For each open position, compare entry price to current mid-price
+            mkt_map = {m.condition_id: m for m in markets}
+            pos_out = {}
+            total_unrealized = 0.0
+            for tid, p in account.positions.items():
+                m = mkt_map.get(p.get("market_id",""))
+                if m:
+                    cur = m.yes_ask if p["outcome"]=="YES" else m.no_ask
+                    unreal = (cur - p["avg_entry"]) * p["size"]
+                else:
+                    unreal = 0.0
+                total_unrealized += unreal
+                pos_out[tid] = {**p,
+                    "unrealized_pnl": round(unreal, 4),
+                    "pnl_pct": round((unreal / max(p["avg_entry"]*p["size"], 0.01)) * 100, 2)}
+
+            nav_mtm = account.balance + account.invested + total_unrealized
+
             save_json(STATE_FILE, {
-                "balance":      account.balance,
-                "positions":    account.positions,
-                "trades":       account.trades[-200:],
-                "realized_pnl": account.realized_pnl,
-                "nav":          account.nav,
-                "win_rate":     account.win_rate,
-                "total_fees":   account.total_fees,
-                "num_trades":   len(account.trades),
+                "balance":          account.balance,
+                "positions":        pos_out,
+                "trades":           account.trades[-100:],
+                "realized_pnl":     account.realized_pnl,
+                "unrealized_pnl":   round(total_unrealized, 4),
+                "nav":              account.nav,
+                "nav_mtm":          round(nav_mtm, 2),
+                "win_rate":         account.win_rate,
+                "total_fees":       account.total_fees,
+                "num_trades":       len(account.trades),
                 "markets": [
                     {"question": m.question[:80],
                      "yes_price": m.yes_ask, "no_price": m.no_ask,
