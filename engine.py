@@ -1,23 +1,40 @@
 """
-Oraculus — Trading Engine v3
-Crypto prices via CoinGecko REST API (polled every 10s).
+Oraculus — Trading Engine v4
+
+Crypto prices via Binance WebSocket (real-time).
+Falls back to CoinGecko REST if Binance WS is geo-blocked (Render).
+
 Three live strategies: SPREAD_FADE, CROSS_MARKET, DEP_GRAPH.
+
+Fixes in v4 vs v3:
+  - BinanceWSFeed: real WebSocket stream (btcusdt/ethusdt/solusdt @ticker)
+    with automatic CoinGecko fallback on connection failure / 451 block.
+  - _update(): fixed return_10s filter (was: `now-20 <= now-t <= now-8`
+    which evaluates to `8 <= t <= 20` in epoch seconds → always empty.
+    Now: `8 <= (now - t) <= 20` — correct age-window filter.)
+  - Position settlement: positions are auto-closed when market probability
+    crosses 0.97 or 0.03, crediting PnL to balance.
+  - Stale eviction: now credits mark-to-market value back to balance
+    instead of silently destroying capital.
 """
 
 from __future__ import annotations
+
 import asyncio, json, logging, re, time, random
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
+
 from config import *
 
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(
+    level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(message)s",
-    handlers=[logging.StreamHandler()])
+    handlers=[logging.StreamHandler()]
+)
 log = logging.getLogger("oraculus")
-
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
@@ -30,7 +47,6 @@ class MarketData:
     yes_depth: float = 0.0; no_depth: float = 0.0
     category: str = ""; volume: float = 0.0
 
-    # yes_price / no_price = ask prices (cost to buy)
     @property
     def yes_price(self): return self.yes_ask
     @property
@@ -38,7 +54,7 @@ class MarketData:
     @property
     def total_cost(self): return self.yes_ask + self.no_ask
     @property
-    def spread(self): return self.yes_ask - self.yes_bid   # ask-bid spread YES side
+    def spread(self): return self.yes_ask - self.yes_bid
     @property
     def neg_risk_edge(self): return round(1.0 - self.total_cost, 4)
     @property
@@ -51,8 +67,12 @@ class CryptoPrice:
     price: float
     bid: float = 0.0
     ask: float = 0.0
-    return_5s: float = 0.0
+    return_10s: float = 0.0      # 10-second rolling return (was return_5s — now named correctly)
     change_24h: float = 0.0
+
+    # Alias for backwards compat with existing dashboard / DEP_GRAPH code
+    @property
+    def return_5s(self): return self.return_10s
 
 
 # ── State I/O ─────────────────────────────────────────────────────────────────
@@ -64,6 +84,7 @@ def save_json(path: str, data: dict):
     except Exception as e:
         log.warning(f"Save {path}: {e}")
 
+
 def load_json(path: str) -> dict:
     try:
         with open(path) as f:
@@ -72,39 +93,45 @@ def load_json(path: str) -> dict:
         return {}
 
 
-# ── Crypto Feed (CoinGecko REST — polled every 10s) ──────────────────────────
+# ── Crypto Feed ───────────────────────────────────────────────────────────────
+#
+#  Primary:  Binance combined WebSocket stream (real-time, no API key needed)
+#            wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/...
+#            Gives live bid/ask/price/24h-change; updates on every trade.
+#
+#  Fallback: CoinGecko REST API polled every CRYPTO_POLL_SEC seconds.
+#            Used automatically if Binance WS is geo-blocked (Render US servers
+#            return HTTP 451 on Binance REST but WS may also be blocked).
+#
+#  Both paths share the same _update() method and price history buffer.
+#  The 10-second rolling return is computed from the shared history.
 
-class CryptoFeed:
+class BinanceWSFeed:
     """
-    Polls CoinGecko public API for BTC/ETH/SOL prices every 10 seconds.
-    CoinGecko has no geo-restrictions and needs no API key.
-    Binance blocks all requests from Render's US-based servers (HTTP 451).
-
-    Single call to /simple/price fetches all 3 coins at once:
-      GET https://api.coingecko.com/api/v3/simple/price
-          ?ids=bitcoin,ethereum,solana
-          &vs_currencies=usd
-          &include_24hr_change=true
-          &include_bid_ask_spread=true   (not available on free tier, so we synthesise spread)
-
-    Free tier: 30 calls/min — polling every 10s uses only 6 calls/min.
+    Streams BTC/ETH/SOL prices from Binance combined ticker WebSocket.
+    Auto-falls back to CoinGecko REST on geo-block or any connection failure.
     """
-    # CoinGecko coin IDs → internal symbol names (matching the rest of the codebase)
-    COIN_MAP = {
-        "bitcoin": "btcusdt",
-        "ethereum": "ethusdt",
-        "solana": "solusdt",
-    }
-    COINGECKO_URL = f"{COINGECKO_API}/simple/price"
-    REST_POLL_SEC = CRYPTO_POLL_SEC
 
-    # Typical bid-ask spreads as a fraction of mid-price (used to synthesise bid/ask)
+    WS_URL = (
+        "wss://stream.binance.com:9443/stream"
+        "?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker"
+    )
+
+    # Binance symbol (uppercase) → internal symbol key
+    SYM_MAP = {"BTCUSDT": "btcusdt", "ETHUSDT": "ethusdt", "SOLUSDT": "solusdt"}
+
+    # Typical bid-ask half-spread as fraction of mid (used to synthesise when absent)
     SPREAD_EST = {"btcusdt": 0.0002, "ethusdt": 0.0003, "solusdt": 0.0008}
+
+    # CoinGecko fallback params
+    CG_URL   = f"{COINGECKO_API}/simple/price"
+    CG_COINS = {"bitcoin": "btcusdt", "ethereum": "ethusdt", "solana": "solusdt"}
 
     def __init__(self):
         self._prices: Dict[str, CryptoPrice] = {}
-        self._hist:   Dict[str, List[Tuple[float,float]]] = {}
-        self._ws_ok   = True   # no WebSocket — flag stays True so dashboard shows green
+        self._hist:   Dict[str, List[Tuple[float, float]]] = {}
+        self.ws_ok   = False          # True = Binance WS live; False = CoinGecko fallback
+        self._cg_fallback = False     # latched True if WS fails
         self._session: Optional[aiohttp.ClientSession] = None
 
     def set_session(self, s: aiohttp.ClientSession):
@@ -113,83 +140,152 @@ class CryptoFeed:
     def get(self) -> Dict[str, CryptoPrice]:
         return dict(self._prices)
 
-    def _update(self, sym: str, price: float, change_24h: float):
-        # Synthesise bid/ask from estimated spread
-        half = price * self.SPREAD_EST.get(sym, 0.0005) / 2
-        bid, ask = price - half, price + half
-        now  = time.time()
+    # ── Shared price-update logic ──────────────────────────────────────────────
+
+    def _update(self, sym: str, price: float,
+                bid: float, ask: float, change_24h: float):
+        """
+        Update price history and compute 10-second rolling return.
+
+        FIX: original condition was `now - 20 <= now - t <= now - 8`
+        which simplifies to `8 <= t <= 20` (absolute epoch time — always empty).
+        Correct condition: `8 <= (now - t) <= 20`  (age of the history entry).
+        """
+        now = time.time()
         hist = self._hist.setdefault(sym, [])
         hist.append((now, price))
-        self._hist[sym] = [(t, p) for t, p in hist if t > now - 60]  # keep 60s
-        # Use entries from 10-20s ago to compute return — matches poll cadence
-        old = [p for t, p in self._hist[sym] if now - 20 <= now - t <= now - 8]
+        # Keep 60-second rolling window
+        self._hist[sym] = [(t, p) for t, p in hist if t > now - 60]
+
+        # Entries between 8 and 20 seconds old → use as the baseline
+        old = [p for t, p in self._hist[sym] if 8 <= (now - t) <= 20]
         if not old:
-            # fallback: any entry older than 8s
-            old = [p for t, p in self._hist[sym] if t <= now - 8]
-        ret5 = (price - old[-1]) / old[-1] if old and old[-1] > 0 else 0.0
-        self._prices[sym] = CryptoPrice(sym, round(price, 2), bid, ask, ret5, change_24h)
+            # Fallback: any entry older than 5s
+            old = [p for t, p in self._hist[sym] if (now - t) >= 5]
+        ret = (price - old[-1]) / old[-1] if old and old[-1] > 0 else 0.0
+
+        # Synthesise bid/ask if not provided (CoinGecko path)
+        if bid <= 0 or ask <= 0:
+            half = price * self.SPREAD_EST.get(sym, 0.0005) / 2
+            bid, ask = price - half, price + half
+
+        self._prices[sym] = CryptoPrice(
+            sym, round(price, 2), bid, ask, ret, change_24h
+        )
+
+    # ── Run-forever (tries WS, latches to CoinGecko on failure) ───────────────
 
     async def run_forever(self):
-        """Background task — polls CoinGecko every REST_POLL_SEC seconds."""
-        log.info("CryptoFeed: starting CoinGecko polling (Binance geo-blocked on Render)")
+        log.info("CryptoFeed: starting (will try Binance WS first)")
         while True:
-            try:
-                await self._poll_once()
-            except Exception as e:
-                log.warning(f"CryptoFeed poll error: {e}")
-            await asyncio.sleep(self.REST_POLL_SEC)
+            if not self._cg_fallback:
+                try:
+                    await self._run_ws()
+                except Exception as e:
+                    log.warning(
+                        f"BinanceWS failed ({e}) — "
+                        "switching to CoinGecko fallback permanently"
+                    )
+                    self._cg_fallback = True
+                    self.ws_ok = False
+                    await asyncio.sleep(2)
+            else:
+                try:
+                    await self._poll_coingecko()
+                except Exception as e:
+                    log.warning(f"CoinGecko poll error: {e}")
+                await asyncio.sleep(CRYPTO_POLL_SEC)
 
-    async def _poll_once(self):
-        """Single request fetches all coins. Handles rate-limit (429) gracefully."""
+    # ── Binance WebSocket path ─────────────────────────────────────────────────
+
+    async def _run_ws(self):
+        log.info(f"BinanceWS: connecting to {self.WS_URL[:60]}...")
+        if not self._session:
+            raise RuntimeError("No aiohttp session")
+
+        async with self._session.ws_connect(
+            self.WS_URL,
+            heartbeat=20,
+            timeout=aiohttp.ClientWSTimeout(ws_close=10.0),
+            headers={"User-Agent": "oraculus-engine/4.0"},
+        ) as ws:
+            self.ws_ok = True
+            self._cg_fallback = False
+            log.info("BinanceWS: connected ✓  (real-time streaming)")
+
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        outer = json.loads(msg.data)
+                        ticker = outer.get("data", {})
+                        raw_sym = ticker.get("s", "")
+                        sym = self.SYM_MAP.get(raw_sym)
+                        if not sym:
+                            continue
+                        price = float(ticker.get("c") or 0)
+                        bid   = float(ticker.get("b") or 0)
+                        ask   = float(ticker.get("a") or 0)
+                        pct   = float(ticker.get("P") or 0)
+                        if price > 0:
+                            self._update(sym, price, bid, ask, pct)
+                    except Exception as e:
+                        log.debug(f"BinanceWS parse: {e}")
+
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    raise Exception(f"WS closed/errored: {msg.type}")
+
+        raise Exception("WS loop exited unexpectedly")
+
+    # ── CoinGecko fallback path ────────────────────────────────────────────────
+
+    async def _poll_coingecko(self):
         if not self._session:
             return
-        try:
-            async with self._session.get(
-                self.COINGECKO_URL,
-                params={
-                    "ids": ",".join(self.COIN_MAP.keys()),
-                    "vs_currencies": "usd",
-                    "include_24hr_change": "true",
-                },
-                timeout=aiohttp.ClientTimeout(total=8),
-                headers={"Accept": "application/json",
-                         "User-Agent": "oraculus-engine/3.0"},
-            ) as r:
-                if r.status == 200:
-                    data = await r.json(content_type=None)
-                    got = 0
-                    for coin_id, sym in self.COIN_MAP.items():
-                        d = data.get(coin_id, {})
-                        price = d.get("usd")
-                        if price:
-                            change = d.get("usd_24h_change", 0.0) or 0.0
-                            self._update(sym, float(price), float(change))
-                            got += 1
-                    if got > 0 and not hasattr(self, "_logged_ok"):
-                        btc = self._prices.get("btcusdt")
-                        log.info(f"CryptoFeed CoinGecko OK — "
-                                 f"BTC=${btc.price:,.0f} | polling every {self.REST_POLL_SEC}s")
-                        self._logged_ok = True
-                elif r.status == 429:
-                    log.warning("CryptoFeed: CoinGecko rate-limited (429) — backing off 30s")
-                    await asyncio.sleep(30)
-                else:
-                    body = await r.text()
-                    log.warning(f"CryptoFeed CoinGecko → {r.status}: {body[:120]}")
-        except Exception as e:
-            log.warning(f"CryptoFeed _poll_once: {e}")
+        async with self._session.get(
+            self.CG_URL,
+            params={
+                "ids": ",".join(self.CG_COINS.keys()),
+                "vs_currencies": "usd",
+                "include_24hr_change": "true",
+            },
+            timeout=aiohttp.ClientTimeout(total=8),
+            headers={"Accept": "application/json", "User-Agent": "oraculus-engine/4.0"},
+        ) as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                got = 0
+                for coin_id, sym in self.CG_COINS.items():
+                    d = data.get(coin_id, {})
+                    price = d.get("usd")
+                    if price:
+                        change = float(d.get("usd_24h_change", 0) or 0)
+                        self._update(sym, float(price), 0.0, 0.0, change)
+                        got += 1
+                if got and not hasattr(self, "_cg_logged"):
+                    btc = self._prices.get("btcusdt")
+                    log.info(
+                        f"CoinGecko fallback OK — "
+                        f"BTC=${btc.price:,.0f} | polling every {CRYPTO_POLL_SEC}s"
+                    )
+                    self._cg_logged = True
+            elif r.status == 429:
+                log.warning("CoinGecko 429 — backing off 30s")
+                await asyncio.sleep(30)
+            else:
+                body = await r.text()
+                log.warning(f"CoinGecko → {r.status}: {body[:120]}")
 
 
-# ── Data Fetcher ──────────────────────────────────────────────────────────────
+# ── Rate Limiter ──────────────────────────────────────────────────────────────
 
 class RateLimiter:
-    """
-    Token-bucket rate limiter for a single endpoint.
-    Blocks callers until a token is available.
-    """
     def __init__(self, rate_per_sec: float):
-        self._rate   = rate_per_sec          # tokens added per second
-        self._tokens = rate_per_sec          # start full
+        self._rate   = rate_per_sec
+        self._tokens = rate_per_sec
         self._last   = time.monotonic()
         self._lock   = asyncio.Lock()
 
@@ -202,56 +298,27 @@ class RateLimiter:
             if self._tokens >= 1:
                 self._tokens -= 1
                 return
-            # Need to wait for next token
             wait = (1 - self._tokens) / self._rate
             self._tokens = 0
-        await asyncio.sleep(wait)
+            await asyncio.sleep(wait)
 
+
+# ── Data Fetcher ──────────────────────────────────────────────────────────────
 
 class DataFetcher:
-    """
-    Rate-limit-aware market data fetcher.
-
-    Rate limits observed / documented:
-      Gamma /markets    : ~10 req/min safe  → we call once per 25s = 2.4/min ✅
-      CLOB  /book       : ~120 req/min safe → we throttle to 2 req/s = 120/min ✅
-      CLOB  /book burst : semaphore=8       → max 8 in-flight at once, with jitter
-
-    Strategies:
-      1. Token-bucket rate limiter (2 req/s) on CLOB orderbook calls.
-      2. Semaphore(8) limits in-flight concurrent requests.
-      3. Random jitter (0-200ms) staggers requests in each batch.
-      4. Exponential backoff with jitter on 429/5xx (up to 4 retries).
-      5. Per-token book cache: unchanged books reused across refresh cycles.
-         Only re-fetches a book if it wasn't cached or cache is >60s old.
-      6. Priority queue: high-volume markets fetched first; tail end dropped
-         gracefully if rate limit is hit.
-    """
-
-    # CLOB: 5 requests/sec sustained = 300/min, under ~400/min Polymarket limit
-    # With semaphore=10 and jitter, actual burst is well-controlled
     CLOB_RATE_PER_SEC = 5.0
-    # Max in-flight concurrent CLOB requests
     CLOB_CONCURRENCY  = 10
-    # Max markets to fetch books for per cycle (400 token IDs = 80s at 5/s)
     MAX_CLOB_MARKETS  = 200
-    # Book cache TTL in seconds — reuse cached books younger than this
     BOOK_CACHE_TTL    = 90
 
     def __init__(self, session: aiohttp.ClientSession):
-        self._s          = session
-        self._clob_rl    = RateLimiter(self.CLOB_RATE_PER_SEC)
-        self._sem        = asyncio.Semaphore(self.CLOB_CONCURRENCY)
-        # book_cache: token_id → {"data": dict, "ts": float}
+        self._s        = session
+        self._clob_rl  = RateLimiter(self.CLOB_RATE_PER_SEC)
+        self._sem      = asyncio.Semaphore(self.CLOB_CONCURRENCY)
         self._book_cache: Dict[str, dict] = {}
-
-    # ── Generic GET with exponential backoff ─────────────────────────────────
 
     async def _get(self, url: str, params=None, timeout: int = 15,
                    retries: int = 3, label: str = "") -> Optional[dict]:
-        """
-        GET with retry + exponential backoff. Handles 429 and 5xx.
-        """
         for attempt in range(retries + 1):
             try:
                 async with self._s.get(
@@ -285,38 +352,25 @@ class DataFetcher:
         log.debug(f"Gave up on {label or url[-40:]} after {retries+1} attempts")
         return None
 
-    # ── CLOB book fetch with rate limiting + cache ────────────────────────────
-
     async def _fetch_book(self, tid: str) -> Optional[dict]:
-        """
-        Fetch one CLOB orderbook. Checks cache first. Applies rate limiting + jitter.
-        """
-        # Cache hit — reuse if fresh enough
         cached = self._book_cache.get(tid)
         if cached and (time.time() - cached["ts"]) < self.BOOK_CACHE_TTL:
             return cached["data"]
-
-        # Jitter: spread requests in time (0–200ms per slot)
         await asyncio.sleep(random.uniform(0, 0.2))
-
         async with self._sem:
             await self._clob_rl.acquire()
             data = await self._get(
                 f"{POLYMARKET_CLOB}/book",
                 params={"token_id": tid},
-                timeout=8,
-                retries=2,
+                timeout=8, retries=2,
                 label=f"CLOB/book/{tid[:12]}"
             )
-
-        if data is not None:
-            self._book_cache[tid] = {"data": data, "ts": time.time()}
-        return data
-
-    # ── Market fetch ─────────────────────────────────────────────────────────
+            if data is not None:
+                self._book_cache[tid] = {"data": data, "ts": time.time()}
+            return data
 
     async def fetch_markets(self) -> List[MarketData]:
-        # ── Step 1: Gamma market list ─────────────────────────────────────────
+        # Step 1: Gamma market list
         raw = await self._get(
             f"{POLYMARKET_GAMMA}/markets",
             params={"active": "true", "closed": "false", "limit": 500},
@@ -335,21 +389,22 @@ class DataFetcher:
             return []
         log.info(f"Gamma: {len(items)} markets")
 
-        # ── Step 2: Parse token pairs, sorted by volume (high volume first) ──
+        # Step 2: Parse token pairs, sorted by volume
         token_pairs = []
         gamma_map   = {}
         for m in items:
             cid = m.get("conditionId") or m.get("condition_id") or m.get("id") or ""
             q   = (m.get("question") or "").strip()
-            if not cid or not q: continue
+            if not cid or not q:
+                continue
             gamma_map[cid] = m
             cat = m.get("category", "")
-            try: vol = float(m.get("volume") or 0)
+            try:   vol = float(m.get("volume") or 0)
             except: vol = 0.0
 
             ids = m.get("clobTokenIds") or m.get("clob_token_ids") or []
             if isinstance(ids, str):
-                try: ids = json.loads(ids)
+                try:    ids = json.loads(ids)
                 except: ids = []
 
             tokens = m.get("tokens", [])
@@ -362,15 +417,13 @@ class DataFetcher:
             if len(ids) >= 2 and ids[0] and ids[1]:
                 token_pairs.append((cid, str(ids[0]), str(ids[1]), q, cat, vol))
 
-        # Sort by volume descending — fetch the most liquid markets first.
-        # If we hit rate limits, we drop the tail (illiquid markets), not the head.
         token_pairs.sort(key=lambda x: x[5], reverse=True)
         token_pairs = token_pairs[:self.MAX_CLOB_MARKETS]
         log.info(f"Token pairs: {len(token_pairs)} (top {self.MAX_CLOB_MARKETS} by volume)")
-        if not token_pairs: return []
+        if not token_pairs:
+            return []
 
-        # ── Step 3: Rate-limited CLOB orderbook fetch ─────────────────────────
-        # Deduplicate token IDs, preserving volume-priority order
+        # Step 3: Rate-limited CLOB orderbook fetch
         seen_tids: set = set()
         ordered_tids: List[str] = []
         for _, yid, nid, *_ in token_pairs:
@@ -380,9 +433,7 @@ class DataFetcher:
                     ordered_tids.append(tid)
 
         book_cache: Dict[str, Optional[dict]] = {}
-
-        # Fetch in parallel but gated by semaphore + rate limiter
-        tasks = [self._fetch_book(tid) for tid in ordered_tids]
+        tasks   = [self._fetch_book(tid) for tid in ordered_tids]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for tid, res in zip(ordered_tids, results):
             if isinstance(res, Exception):
@@ -392,19 +443,20 @@ class DataFetcher:
                 book_cache[tid] = res
 
         filled = sum(1 for v in book_cache.values() if v)
-        cached = sum(1 for tid in ordered_tids
-                     if tid in self._book_cache
-                     and (time.time() - self._book_cache[tid]["ts"]) < self.BOOK_CACHE_TTL
-                     and book_cache.get(tid) is not None)
+        cached = sum(
+            1 for tid in ordered_tids
+            if tid in self._book_cache
+            and (time.time() - self._book_cache[tid]["ts"]) < self.BOOK_CACHE_TTL
+            and book_cache.get(tid) is not None
+        )
         log.info(f"CLOB orderbooks: {filled}/{len(ordered_tids)} "
                  f"({cached} from cache, {filled-cached} fresh)")
 
-        # ── Step 4: Build MarketData ──────────────────────────────────────────
+        # Step 4: Build MarketData
         result = []
         for cid, yid, nid, q, cat, vol in token_pairs:
             ybook = book_cache.get(yid)
             nbook = book_cache.get(nid)
-
             yes_ask = yes_bid = no_ask = no_bid = 0.0
             yes_depth = no_depth = 0.0
 
@@ -422,12 +474,12 @@ class DataFetcher:
                 if bids: no_bid = float(bids[0].get("price", 0))
                 no_depth = sum(float(a.get("size", 0)) for a in asks[:5])
 
-            # Gamma mid fallback — used when CLOB book is missing
+            # Gamma mid-price fallback when CLOB book is missing
             if not yes_ask or not no_ask:
                 m_raw = gamma_map.get(cid, {})
                 op = m_raw.get("outcomePrices", "[]")
                 if isinstance(op, str):
-                    try: op = json.loads(op)
+                    try:    op = json.loads(op)
                     except: op = []
                 if len(op) >= 2:
                     try:
@@ -435,100 +487,158 @@ class DataFetcher:
                         yes_bid = max(0.01, yes_ask - 0.02)
                         no_bid  = max(0.01, no_ask  - 0.02)
                     except: pass
+                if yes_depth == 0.0: yes_depth = MIN_DEPTH
+                if no_depth  == 0.0: no_depth  = MIN_DEPTH
 
-            if yes_depth == 0.0: yes_depth = MIN_DEPTH
-            if no_depth  == 0.0: no_depth  = MIN_DEPTH
+            if not yes_ask or not no_ask:                  continue
+            if not (0.01 < yes_ask < 0.99):                continue
 
-            if not yes_ask or not no_ask: continue
-            if not (0.01 < yes_ask < 0.99): continue
-
-            result.append(MarketData(cid, q, yid, nid,
+            result.append(MarketData(
+                cid, q, yid, nid,
                 yes_ask, no_ask, yes_bid, no_bid,
-                yes_depth, no_depth, cat, vol))
+                yes_depth, no_depth, cat, vol
+            ))
 
         log.info(f"Built {len(result)} markets")
         return result
-
 
 
 # ── Paper Account ─────────────────────────────────────────────────────────────
 
 class PaperAccount:
     def __init__(self):
-        self.balance = STARTING_BALANCE
+        self.balance   = STARTING_BALANCE
         self.positions = {}
-        self.trades = []
-        self._ctr = 0
+        self.trades    = []
+        self._ctr      = 0
         d = load_json(PERSIST_FILE)
         if d:
-            self.balance   = d.get("balance", STARTING_BALANCE)
-            self.trades    = d.get("trades", [])
-            self.positions = d.get("positions", {})
+            self.balance   = d.get("balance",   STARTING_BALANCE)
+            self.trades    = d.get("trades",     [])
+            self.positions = d.get("positions",  {})
             self._ctr      = len(self.trades)
             log.info(f"Resumed: {len(self.trades)} trades, ${self.balance:.2f}")
 
     def _save(self):
-        save_json(PERSIST_FILE, {"balance": self.balance,
-            "trades": self.trades[-500:], "positions": self.positions})
+        save_json(PERSIST_FILE, {
+            "balance":   self.balance,
+            "trades":    self.trades[-500:],
+            "positions": self.positions,
+        })
 
     def buy(self, market_id, question, token_id, outcome,
             price, size_usd, strategy, edge) -> Optional[dict]:
-        if size_usd < MIN_BET_SIZE or not (0 < price < 1): return None
+        if size_usd < MIN_BET_SIZE or not (0 < price < 1):
+            return None
         fee   = size_usd * TAKER_FEE
         total = size_usd + fee
         if total > self.balance:
             size_usd = self.balance * 0.90 / (1 + TAKER_FEE)
-            if size_usd < MIN_BET_SIZE: return None
+            if size_usd < MIN_BET_SIZE:
+                return None
             fee   = size_usd * TAKER_FEE
             total = size_usd + fee
         self.balance -= total
         self._ctr += 1
-        t = {"id": f"T{self._ctr:05d}", "market_id": market_id,
-             "question": question[:70], "token_id": token_id,
-             "outcome": outcome, "side": "BUY", "price": price,
-             "size": size_usd/price, "cost": total, "fee": fee,
-             "pnl": 0.0, "strategy": strategy, "edge": edge,
-             "timestamp": datetime.now(timezone.utc).isoformat()}
+        t = {
+            "id":        f"T{self._ctr:05d}",
+            "market_id": market_id,
+            "question":  question[:70],
+            "token_id":  token_id,
+            "outcome":   outcome,
+            "side":      "BUY",
+            "price":     price,
+            "size":      size_usd / price,
+            "cost":      total,
+            "fee":       fee,
+            "pnl":       0.0,
+            "strategy":  strategy,
+            "edge":      edge,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
         self.trades.append(t)
         if token_id in self.positions:
-            p  = self.positions[token_id]
-            tc = p["avg_entry"]*p["size"] + price*(size_usd/price)
-            p["size"]     += size_usd/price
-            p["avg_entry"] = tc/p["size"]
+            p = self.positions[token_id]
+            tc = p["avg_entry"] * p["size"] + price * (size_usd / price)
+            p["size"]      += size_usd / price
+            p["avg_entry"]  = tc / p["size"]
         else:
             self.positions[token_id] = {
-                "market_id": market_id, "question": question[:70],
-                "token_id": token_id, "outcome": outcome,
-                "size": size_usd/price, "avg_entry": price,
-                "strategy": strategy,
-                "opened_at": datetime.now(timezone.utc).isoformat()}
+                "market_id": market_id,
+                "question":  question[:70],
+                "token_id":  token_id,
+                "outcome":   outcome,
+                "size":      size_usd / price,
+                "avg_entry": price,
+                "strategy":  strategy,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+            }
         self._save()
         return t
 
+    def settle(self, token_id: str, settle_price: float) -> Optional[dict]:
+        """
+        Close a position at settle_price (0.0 = total loss, 1.0 = full win).
+        Credits proceeds back to balance and records a SELL trade.
+        """
+        p = self.positions.pop(token_id, None)
+        if p is None:
+            return None
+        proceeds = settle_price * p["size"]
+        pnl      = proceeds - p["avg_entry"] * p["size"]
+        self.balance += proceeds
+        self._ctr += 1
+        t = {
+            "id":        f"T{self._ctr:05d}",
+            "market_id": p["market_id"],
+            "question":  p["question"],
+            "token_id":  token_id,
+            "outcome":   p["outcome"],
+            "side":      "SELL",
+            "price":     settle_price,
+            "size":      p["size"],
+            "cost":      0.0,
+            "fee":       0.0,
+            "pnl":       round(pnl, 4),
+            "strategy":  p["strategy"],
+            "edge":      0.0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.trades.append(t)
+        self._save()
+        log.info(
+            f"SETTLE {t['id']} {p['outcome']} @{settle_price:.2f} "
+            f"pnl={'+'if pnl>=0 else ''}{pnl:.2f}"
+        )
+        return t
+
     @property
-    def realized_pnl(self): return sum(t["pnl"] for t in self.trades if t["side"]=="SELL")
+    def realized_pnl(self):
+        return sum(t["pnl"] for t in self.trades if t["side"] == "SELL")
+
     @property
-    def invested(self): return sum(p["size"]*p["avg_entry"] for p in self.positions.values())
+    def invested(self):
+        return sum(p["size"] * p["avg_entry"] for p in self.positions.values())
+
     @property
-    def nav(self): return self.balance + self.invested
+    def nav(self):
+        return self.balance + self.invested
+
     @property
-    def total_fees(self): return sum(t["fee"] for t in self.trades)
+    def total_fees(self):
+        return sum(t["fee"] for t in self.trades)
+
     @property
     def win_rate(self):
-        sells = [t for t in self.trades if t["side"]=="SELL"]
-        return sum(1 for t in sells if t["pnl"]>0)/len(sells) if sells else 0.0
+        sells = [t for t in self.trades if t["side"] == "SELL"]
+        return sum(1 for t in sells if t["pnl"] > 0) / len(sells) if sells else 0.0
 
 
 # ── Strategies ────────────────────────────────────────────────────────────────
 
 def kelly_size(prob, price, balance):
-    """
-    Fractional Kelly bet size.
-    prob  = true probability estimate (0-1)
-    price = cost to buy one contract (0-1)
-    Returns dollar bet size capped at MAX_BET_SIZE.
-    """
-    if price <= 0 or price >= 1 or prob <= 0 or prob >= 1: return 0.0
+    if price <= 0 or price >= 1 or prob <= 0 or prob >= 1:
+        return 0.0
     b = (1.0 - price) / price
     q = 1.0 - prob
     f = (b * prob - q) / b
@@ -537,31 +647,20 @@ def kelly_size(prob, price, balance):
 
 
 def _mid(ask: float, bid: float) -> float:
-    """Mid-price; falls back to ask if bid is missing."""
     return (ask + bid) / 2.0 if bid > 0.001 else ask
 
 
 def scan_spread_fade(markets: List[MarketData], balance: float) -> List[dict]:
     """
-    SPREAD_FADE: Exploit bid-ask spread mispricing.
-
-    Case 1 - Long NO on very unlikely events:
-      YES_ask < 0.12  ->  true NO prob ~= 1 - YES_mid ~= 0.90+
-      Buy NO at no_ask if edge = (1 - yes_mid) - no_ask - fee > MIN_EDGE
-
-    Case 2 - Long YES on near-certain events:
-      YES_mid > 0.92  ->  true YES prob ~= 1 - NO_mid ~= 0.92+
-      Buy YES at yes_ask if edge = (1 - no_mid) - yes_ask - fee > MIN_EDGE
-
-    Note: on real CLOB markets bids are often absent (0.0), so _mid() falls
-    back to the ask. This means yes_mid = yes_ask and the edge condition
-    reduces to: no_ask < (1 - yes_ask) - fee. We use a lower per-strategy
-    MIN_EDGE of 0.002 to catch real-market spreads that are tighter than
-    the global 0.4% threshold.
+    SPREAD_FADE: Exploit bid-ask spread mispricing on near-certain/near-zero markets.
+    Case 1 — Long NO on very unlikely events  (YES ask < 0.12)
+    Case 2 — Long YES on near-certain events  (YES mid > 0.90)
+    Each market can only fire one signal (Case 1 takes priority).
     """
-    SF_MIN_EDGE = 0.002   # lower threshold for this strategy on real markets
+    SF_MIN_EDGE = 0.002
     out = []
     for m in markets:
+        fired = False
 
         # Case 1: Long NO on very unlikely events
         if 0.01 < m.yes_ask < 0.12:
@@ -574,98 +673,92 @@ def scan_spread_fade(markets: List[MarketData], balance: float) -> List[dict]:
                     out.append({
                         "strategy": "SPREAD_FADE",
                         "market_id": m.condition_id,
-                        "question": m.question,
-                        "token_id": m.no_token_id,
-                        "outcome": "NO",
-                        "price": m.no_ask,
-                        "edge": round(edge, 5),
-                        "size": size,
-                        "reason": f"YES_mid={yes_mid:.3f} implied_NO={implied_no:.3f} no_ask={m.no_ask:.3f}"
+                        "question":  m.question,
+                        "token_id":  m.no_token_id,
+                        "outcome":   "NO",
+                        "price":     m.no_ask,
+                        "edge":      round(edge, 5),
+                        "size":      size,
+                        "reason":    f"YES_mid={yes_mid:.3f} implied_NO={implied_no:.3f} no_ask={m.no_ask:.3f}",
                     })
+                    fired = True
 
-        # Case 2: Long YES on near-certain events (filter on mid, not ask)
-        yes_mid = _mid(m.yes_ask, m.yes_bid)
-        if 0.90 < yes_mid < 0.990:
-            no_mid      = _mid(m.no_ask, m.no_bid)
-            implied_yes = 1.0 - no_mid
-            edge        = implied_yes - m.yes_ask - TAKER_FEE
-            if edge >= SF_MIN_EDGE and m.yes_depth >= MIN_DEPTH:
-                size = min(kelly_size(implied_yes, m.yes_ask, balance), m.yes_depth * 0.10)
-                if size >= MIN_BET_SIZE:
-                    out.append({
-                        "strategy": "SPREAD_FADE",
-                        "market_id": m.condition_id,
-                        "question": m.question,
-                        "token_id": m.yes_token_id,
-                        "outcome": "YES",
-                        "price": m.yes_ask,
-                        "edge": round(edge, 5),
-                        "size": size,
-                        "reason": f"NO_mid={no_mid:.3f} implied_YES={implied_yes:.3f} yes_ask={m.yes_ask:.3f}"
-                    })
+        # Case 2: Long YES on near-certain events (skip if Case 1 already fired on this market)
+        if not fired:
+            yes_mid = _mid(m.yes_ask, m.yes_bid)
+            if 0.90 < yes_mid < 0.990:
+                no_mid      = _mid(m.no_ask, m.no_bid)
+                implied_yes = 1.0 - no_mid
+                edge        = implied_yes - m.yes_ask - TAKER_FEE
+                if edge >= SF_MIN_EDGE and m.yes_depth >= MIN_DEPTH:
+                    size = min(kelly_size(implied_yes, m.yes_ask, balance), m.yes_depth * 0.10)
+                    if size >= MIN_BET_SIZE:
+                        out.append({
+                            "strategy": "SPREAD_FADE",
+                            "market_id": m.condition_id,
+                            "question":  m.question,
+                            "token_id":  m.yes_token_id,
+                            "outcome":   "YES",
+                            "price":     m.yes_ask,
+                            "edge":      round(edge, 5),
+                            "size":      size,
+                            "reason":    f"NO_mid={no_mid:.3f} implied_YES={implied_yes:.3f} yes_ask={m.yes_ask:.3f}",
+                        })
     return out
 
 
 def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
     """
     CROSS_MARKET: Mutually-exclusive groups where sum(YES_asks) > 1.0.
-    Buy NO on markets with the highest neg_risk_edge (most underpriced NO).
-    Edge = neg_risk_edge of that specific market minus fee.
-    Min group size 3 — real Polymarket often has 3-team groups (conf finals, 3-nominee awards).
+    Buy NO on the markets with the highest neg_risk_edge.
+    Min group size 3 — real Polymarket often has 3-team groups.
     """
-    CM_MIN_EDGE = 0.002   # lower than global MIN_EDGE — cross-market edges are structural
+    CM_MIN_EDGE = 0.002
     out = []
 
     def topic_key(q: str) -> Optional[str]:
         q = q.lower()
         checks = [
-            # Basketball
-            (["nba", "finals"],                         "NBA_FINALS"),
-            (["nba", "eastern conference"],             "NBA_EAST_CONF"),
-            (["nba", "western conference"],             "NBA_WEST_CONF"),
-            (["nba", "championship"],                   "NBA_CHAMP"),
-            (["nba", "mvp"],                            "NBA_MVP"),
-            # Hockey
-            (["nhl", "stanley cup"],                    "NHL_CUP"),
-            (["nhl", "mvp"],                            "NHL_MVP"),
-            # Soccer
-            (["champions league", "win"],               "UCL"),
-            (["champions league", "title"],             "UCL"),
-            (["premier league", "win"],                 "EPL"),
-            (["premier league", "title"],               "EPL"),
-            (["la liga", "win"],                        "LALIGA"),
-            (["serie a", "win"],                        "SERIEA"),
-            (["bundesliga", "win"],                     "BUNDESLIGA"),
-            (["world cup", "win"],                      "WORLD_CUP"),
-            (["world cup", "champion"],                 "WORLD_CUP"),
-            # American sports
-            (["super bowl", "win"],                     "SUPERBOWL"),
-            (["super bowl", "champion"],                "SUPERBOWL"),
-            (["world series", "win"],                   "WORLD_SERIES"),
-            (["nfl", "mvp"],                            "NFL_MVP"),
-            (["masters", "golf"],                       "MASTERS"),
-            (["us open", "golf"],                       "US_OPEN_GOLF"),
-            # Awards
-            (["oscar", "best picture"],                 "OSCAR_PICTURE"),
-            (["oscar", "best director"],                "OSCAR_DIRECTOR"),
-            (["oscar", "best actor"],                   "OSCAR_ACTOR"),
-            (["oscar", "best actress"],                 "OSCAR_ACTRESS"),
-            (["emmy", "best drama"],                    "EMMY_DRAMA"),
-            (["emmy", "best comedy"],                   "EMMY_COMEDY"),
-            (["grammy", "album of the year"],           "GRAMMY_AOTY"),
-            (["nobel", "prize"],                        "NOBEL"),
-            # Politics
-            (["presidential", "republican nomination"], "GOP_NOM"),
-            (["presidential", "democratic nomination"], "DEM_NOM"),
-            (["republican", "nominee"],                 "GOP_NOM"),
-            (["democratic", "nominee"],                 "DEM_NOM"),
-            (["presidential", "win", "2028"],           "PRES_2028"),
-            (["president", "2028"],                     "PRES_2028"),
-            # Pop culture
-            (["next james bond"],                       "BOND"),
-            (["james bond"],                            "BOND"),
-            (["next pope"],                             "POPE"),
-            (["pope"],                                  "POPE"),
+            (["nba", "finals"],                       "NBA_FINALS"),
+            (["nba", "eastern conference"],            "NBA_EAST_CONF"),
+            (["nba", "western conference"],            "NBA_WEST_CONF"),
+            (["nba", "championship"],                  "NBA_CHAMP"),
+            (["nba", "mvp"],                           "NBA_MVP"),
+            (["nhl", "stanley cup"],                   "NHL_CUP"),
+            (["nhl", "mvp"],                           "NHL_MVP"),
+            (["champions league", "win"],              "UCL"),
+            (["champions league", "title"],            "UCL"),
+            (["premier league", "win"],                "EPL"),
+            (["premier league", "title"],              "EPL"),
+            (["la liga", "win"],                       "LALIGA"),
+            (["serie a", "win"],                       "SERIEA"),
+            (["bundesliga", "win"],                    "BUNDESLIGA"),
+            (["world cup", "win"],                     "WORLD_CUP"),
+            (["world cup", "champion"],                "WORLD_CUP"),
+            (["super bowl", "win"],                    "SUPERBOWL"),
+            (["super bowl", "champion"],               "SUPERBOWL"),
+            (["world series", "win"],                  "WORLD_SERIES"),
+            (["nfl", "mvp"],                           "NFL_MVP"),
+            (["masters", "golf"],                      "MASTERS"),
+            (["us open", "golf"],                      "US_OPEN_GOLF"),
+            (["oscar", "best picture"],                "OSCAR_PICTURE"),
+            (["oscar", "best director"],               "OSCAR_DIRECTOR"),
+            (["oscar", "best actor"],                  "OSCAR_ACTOR"),
+            (["oscar", "best actress"],                "OSCAR_ACTRESS"),
+            (["emmy", "best drama"],                   "EMMY_DRAMA"),
+            (["emmy", "best comedy"],                  "EMMY_COMEDY"),
+            (["grammy", "album of the year"],          "GRAMMY_AOTY"),
+            (["nobel", "prize"],                       "NOBEL"),
+            (["presidential", "republican nomination"],"GOP_NOM"),
+            (["presidential", "democratic nomination"],"DEM_NOM"),
+            (["republican", "nominee"],                "GOP_NOM"),
+            (["democratic", "nominee"],                "DEM_NOM"),
+            (["presidential", "win", "2028"],          "PRES_2028"),
+            (["president", "2028"],                    "PRES_2028"),
+            (["next james bond"],                      "BOND"),
+            (["james bond"],                           "BOND"),
+            (["next pope"],                            "POPE"),
+            (["pope"],                                 "POPE"),
         ]
         for kws, key in checks:
             if all(k in q for k in kws):
@@ -679,61 +772,57 @@ def scan_cross_market(markets: List[MarketData], balance: float) -> List[dict]:
             groups.setdefault(k, []).append(m)
 
     for group_name, grp in groups.items():
-        if len(grp) < 3: continue        # lowered from 4 — real groups often have 3 members
+        if len(grp) < 3:
+            continue
         yes_sum    = sum(m.yes_ask for m in grp)
         overcharge = yes_sum - 1.0
-        if overcharge < CROSS_MIN_OVERCHARGE: continue
-
-        # Sort by neg_risk_edge descending — picks markets where yes+no is furthest
-        # below 1.0 (longshots with underpriced NOs). Do NOT sort by no_ask ascending —
-        # that selects expensive-NO favourites whose neg_risk_edge is negative.
+        if overcharge < CROSS_MIN_OVERCHARGE:
+            continue
         grp_sorted = sorted(grp, key=lambda m: m.neg_risk_edge, reverse=True)
-
         for m in grp_sorted[:3]:
             edge = m.neg_risk_edge - TAKER_FEE
-            if edge < CM_MIN_EDGE: continue
+            if edge < CM_MIN_EDGE:   continue
             if m.no_depth < MIN_DEPTH: continue
             implied_no = 1.0 - m.yes_ask
-            size = min(kelly_size(implied_no, m.no_ask, balance),
-                       m.no_depth * 0.08, MAX_BET_SIZE)
+            size = min(
+                kelly_size(implied_no, m.no_ask, balance),
+                m.no_depth * 0.08, MAX_BET_SIZE
+            )
             if size < MIN_BET_SIZE: continue
             out.append({
                 "strategy": "CROSS_MARKET",
                 "market_id": m.condition_id,
-                "question": m.question,
-                "token_id": m.no_token_id,
-                "outcome": "NO",
-                "price": m.no_ask,
-                "edge": round(edge, 5),
-                "size": size,
-                "reason": f"{group_name} YES_sum={yes_sum:.3f} neg_risk={m.neg_risk_edge:.3f}"
+                "question":  m.question,
+                "token_id":  m.no_token_id,
+                "outcome":   "NO",
+                "price":     m.no_ask,
+                "edge":      round(edge, 5),
+                "size":      size,
+                "reason":    f"{group_name} YES_sum={yes_sum:.3f} neg_risk={m.neg_risk_edge:.3f}",
             })
-
     return out
 
 
 def scan_dep_graph(markets: List[MarketData], crypto: Dict[str, CryptoPrice],
                    balance: float) -> List[dict]:
     """
-    DEP_GRAPH: Two sub-strategies:
-
-    1. Price-ladder consistency: lower BTC/ETH/SOL strike must have higher YES prob.
-       Kelly prob uses full violation as fair-value correction (not half).
-
-    2. Latency arb: crypto moved, prediction market hasn't repriced.
-       Sensitivity = 3.0 (was 0.35, which was too small to ever clear MIN_EDGE).
+    DEP_GRAPH:
+    1. Price-ladder consistency — lower-strike must have higher YES prob.
+    2. Latency arb — crypto moved; prediction market hasn't repriced yet.
+       (Requires fixed return_10s — was broken in v3 due to filter bug.)
     """
     out = []
 
-    # 1. Price ladder consistency
+    # ── Sub-strategy 1: Price ladder ──────────────────────────────────────────
     groups: Dict[str, list] = {}
     for m in markets:
-        q = m.question.lower()
+        q     = m.question.lower()
         asset = next((a for a, kws in [
             ("BTC", ["btc", "bitcoin"]),
             ("ETH", ["eth", "ethereum"]),
             ("SOL", ["sol", "solana"]),
         ] if any(k in q for k in kws)), None)
+        # Match prices like $80,000  $80k  $80K  $3,500  $150m
         mt = re.search(r'\$([\d,]+\.?\d*)([kKmM]?)', m.question)
         if asset and mt:
             v   = float(mt.group(1).replace(",", ""))
@@ -746,11 +835,10 @@ def scan_dep_graph(markets: List[MarketData], crypto: Dict[str, CryptoPrice],
         grp.sort(key=lambda x: x[1])
         cp   = crypto.get(asset.lower() + "usdt")
         spot = cp.price if cp else 0.0
-
         for i in range(len(grp) - 1):
             ml, vl = grp[i]
             mh, vh = grp[i + 1]
-            viol = mh.yes_ask - ml.yes_ask
+            viol   = mh.yes_ask - ml.yes_ask
             if viol < GRAPH_MIN_VIOLATION: continue
             fair_p = min(0.95, ml.yes_ask + viol)
             size   = kelly_size(fair_p, ml.yes_ask, balance)
@@ -758,139 +846,221 @@ def scan_dep_graph(markets: List[MarketData], crypto: Dict[str, CryptoPrice],
             if size < MIN_BET_SIZE: continue
             out.append({
                 "strategy": "DEP_GRAPH",
-                "market_id": ml.condition_id, "question": ml.question,
-                "token_id":  ml.yes_token_id, "outcome": "YES",
+                "market_id": ml.condition_id,
+                "question":  ml.question,
+                "token_id":  ml.yes_token_id,
+                "outcome":   "YES",
                 "price":     ml.yes_ask,
                 "edge":      round(viol / 2, 5),
                 "size":      size,
                 "reason":    f"{asset}@{spot:,.0f} ${vl:,.0f}<${vh:,.0f} viol={viol:.3f}",
             })
 
-    # 2. Latency arb
+    # ── Sub-strategy 2: Latency arb ───────────────────────────────────────────
+    #
+    #  Now that return_10s is correctly calculated, this strategy can actually fire.
+    #
+    #  Keyword matching: use broad patterns that match real Polymarket question formats.
+    #  E.g. "Will BTC hit $90,000 by..." / "Bitcoin above $100k by..." etc.
+    #  Avoid overly specific dollar strings that won't match question text.
+
     KW = {
-        "btcusdt": ["btc", "bitcoin", "$80", "$90", "$100", "$150", "$200", "hit $"],
-        "ethusdt": ["eth", "ethereum", "$3", "$4", "$5", "hit $"],
-        "solusdt": ["sol", "solana", "hit $"],
+        "btcusdt": ["btc", "bitcoin"],
+        "ethusdt": ["eth", "ethereum"],
+        "solusdt": ["sol", "solana"],
     }
-    TH          = {"btcusdt": 0.0005, "ethusdt": 0.0010, "solusdt": 0.003}
+
+    # Minimum 10-second return to consider latency arb worthwhile
+    # At 3.0x sensitivity: need return >= (MIN_EDGE + fee) / 3.0 = (0.004+0.002)/3 = 0.002
+    # We keep threshold lower to enter the loop; edge filter below catches weak signals.
+    TH = {"btcusdt": 0.0005, "ethusdt": 0.0010, "solusdt": 0.003}
+
     SENSITIVITY = 3.0
 
     for sym, cp in crypto.items():
-        if abs(cp.return_5s) < TH.get(sym, 0.005): continue
+        ret = cp.return_10s
+        if abs(ret) < TH.get(sym, 0.005): continue
         kws = KW.get(sym, [])
-        up  = cp.return_5s > 0
+        up  = ret > 0
+
         for m in markets:
-            if not any(k in m.question.lower() for k in kws): continue
-            delta = SENSITIVITY * cp.return_5s
+            q = m.question.lower()
+            if not any(k in q for k in kws): continue
+
+            # Skip markets that don't reference a price level (no $ in question)
+            # These are "will BTC go up/down" style — less reliable for latency arb
+            if "$" not in m.question: continue
+
+            delta = SENSITIVITY * ret
+
             if up:
                 new_p = max(0.05, min(0.95, m.yes_ask + delta))
                 edge  = new_p - m.yes_ask - TAKER_FEE
                 if edge < MIN_EDGE: continue
-                size = min(kelly_size(new_p, m.yes_ask, balance),
-                           m.yes_depth * 0.10, MAX_BET_SIZE)
+                size = min(
+                    kelly_size(new_p, m.yes_ask, balance),
+                    m.yes_depth * 0.10, MAX_BET_SIZE
+                )
                 if size < MIN_BET_SIZE: continue
                 out.append({
                     "strategy": "DEP_GRAPH",
-                    "market_id": m.condition_id, "question": m.question,
-                    "token_id": m.yes_token_id,  "outcome": "YES",
-                    "price": m.yes_ask, "edge": round(edge, 5), "size": size,
-                    "reason": f"{sym} {cp.return_5s:+.3%}/10s +{delta:.4f}",
+                    "market_id": m.condition_id,
+                    "question":  m.question,
+                    "token_id":  m.yes_token_id,
+                    "outcome":   "YES",
+                    "price":     m.yes_ask,
+                    "edge":      round(edge, 5),
+                    "size":      size,
+                    "reason":    f"{sym} {ret:+.3%}/10s δ={delta:+.4f}",
                 })
             else:
-                new_p = max(0.05, min(0.95, m.yes_ask + delta))
+                new_p = max(0.05, min(0.95, m.yes_ask + delta))   # delta < 0 here
                 edge  = (1.0 - new_p) - m.no_ask - TAKER_FEE
                 if edge < MIN_EDGE: continue
-                size = min(kelly_size(1.0 - new_p, m.no_ask, balance),
-                           m.no_depth * 0.10, MAX_BET_SIZE)
+                size = min(
+                    kelly_size(1.0 - new_p, m.no_ask, balance),
+                    m.no_depth * 0.10, MAX_BET_SIZE
+                )
                 if size < MIN_BET_SIZE: continue
                 out.append({
                     "strategy": "DEP_GRAPH",
-                    "market_id": m.condition_id, "question": m.question,
-                    "token_id": m.no_token_id,   "outcome": "NO",
-                    "price": m.no_ask, "edge": round(edge, 5), "size": size,
-                    "reason": f"{sym} {cp.return_5s:+.3%}/10s {delta:.4f}",
+                    "market_id": m.condition_id,
+                    "question":  m.question,
+                    "token_id":  m.no_token_id,
+                    "outcome":   "NO",
+                    "price":     m.no_ask,
+                    "edge":      round(edge, 5),
+                    "size":      size,
+                    "reason":    f"{sym} {ret:+.3%}/10s δ={delta:+.4f}",
                 })
     return out
 
+
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 
+# Settlement thresholds — market is considered resolved when price crosses these
+SETTLE_WIN_THRESHOLD  = 0.97   # YES/NO ask above this → that side won
+SETTLE_LOSE_THRESHOLD = 0.03   # YES/NO ask below this → that side lost
+
+
 async def run():
-    log.info("ORACULUS v3 Engine starting...")
-    account   = PaperAccount()
+    log.info("ORACULUS v4 Engine starting...")
+    account  = PaperAccount()
     markets: List[MarketData] = []
-    nav_hist  = []
-    all_sigs  = []
-    scan_n    = 0
+    nav_hist = []
+    all_sigs = []
+    scan_n   = 0
     strat_cnt = {"SPREAD_FADE": 0, "CROSS_MARKET": 0, "DEP_GRAPH": 0}
+
     last_market_ref = 0.0
-    refresh_task    = None   # background market refresh task
+    refresh_task    = None
 
     connector = aiohttp.TCPConnector(limit=100)
     async with aiohttp.ClientSession(connector=connector) as session:
-        fetcher = DataFetcher(session)
-
-        crypto_feed = CryptoFeed()
+        fetcher     = DataFetcher(session)
+        crypto_feed = BinanceWSFeed()
         crypto_feed.set_session(session)
         asyncio.create_task(crypto_feed.run_forever())
 
         async def do_refresh():
-            """Background market refresh — never blocks the scan loop."""
             nonlocal markets, last_market_ref
             log.info("Refreshing markets (background)...")
             try:
                 fresh = await fetcher.fetch_markets()
                 if fresh:
                     markets = fresh
-                last_market_ref = time.time()
+                    last_market_ref = time.time()
             except Exception as e:
                 log.error(f"Market refresh error: {e}")
 
         while True:
             now = time.time()
 
-            # Kick off background refresh without awaiting — scan loop keeps running
+            # Background market refresh
             if now - last_market_ref > MARKET_REFRESH_SEC:
                 if refresh_task is None or refresh_task.done():
                     refresh_task = asyncio.create_task(do_refresh())
-                    last_market_ref = now  # prevent re-triggering immediately
+                last_market_ref = now
 
-            # ── Get latest crypto prices (from CoinGecko poll cache) ──────────
             crypto = crypto_feed.get()
 
-            # Run strategies
+            # ── Strategy scans ────────────────────────────────────────────────
             signals = []
             if markets:
                 sf = scan_spread_fade(markets, account.balance)
                 cm = scan_cross_market(markets, account.balance)
                 dg = scan_dep_graph(markets, crypto, account.balance)
                 signals += sf + cm + dg
-                if scan_n % 20 == 1:  # log every ~10s
-                    btc_ret = crypto.get("btcusdt", CryptoPrice("btcusdt",0)).return_5s
+
+                if scan_n % 20 == 1:
+                    btc_ret = (crypto.get("btcusdt") or CryptoPrice("btcusdt", 0)).return_10s
+                    feed_src = "BinanceWS" if crypto_feed.ws_ok else "CoinGecko"
                     log.info(
                         f"Signals: SF={len(sf)} CM={len(cm)} DG={len(dg)} "
                         f"| mkts={len(markets)} held={len(account.positions)} "
-                        f"bal=${account.balance:.0f} btc_ret={btc_ret:+.4f}"
+                        f"bal=${account.balance:.0f} btc_ret={btc_ret:+.4f} src={feed_src}"
                     )
 
             scan_n += 1
-            nav_hist.append({"t": datetime.now(timezone.utc).isoformat(),
-                              "nav": account.nav})
+            nav_hist.append({"t": datetime.now(timezone.utc).isoformat(), "nav": account.nav})
             if len(nav_hist) > 500: nav_hist = nav_hist[-500:]
 
-            # Deduplicate + sort by edge
-            # Evict positions older than 48 h — they've almost certainly resolved
-            # on-chain and shouldn't keep blocking fresh signals on the same market.
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
-            stale = [k for k, p in account.positions.items()
-                     if datetime.fromisoformat(
-                         p.get("opened_at", "2000-01-01T00:00:00+00:00")
-                         .replace("Z", "+00:00")) < cutoff]
-            for k in stale:
-                del account.positions[k]
-                log.info(f"Evicted stale position {k[:20]}...")
+            # ── Position settlement ───────────────────────────────────────────
+            #
+            # For each open position, check if the current CLOB price indicates
+            # the market has resolved. Settle those positions and credit balance.
+            #
+            mkt_map = {m.condition_id: m for m in markets}
 
-            held = set(account.positions.keys())
-            seen = set(); clean = []
+            for tid, p in list(account.positions.items()):
+                m = mkt_map.get(p.get("market_id", ""))
+                if not m:
+                    continue
+                outcome = p["outcome"]
+                if outcome == "YES":
+                    if m.yes_ask > SETTLE_WIN_THRESHOLD:
+                        account.settle(tid, 1.0)   # YES won
+                    elif m.yes_ask < SETTLE_LOSE_THRESHOLD:
+                        account.settle(tid, 0.0)   # YES lost
+                elif outcome == "NO":
+                    if m.no_ask > SETTLE_WIN_THRESHOLD:
+                        account.settle(tid, 1.0)   # NO won
+                    elif m.no_ask < SETTLE_LOSE_THRESHOLD:
+                        account.settle(tid, 0.0)   # NO lost
+
+            # ── Stale position eviction ───────────────────────────────────────
+            #
+            # FIX v3→v4: stale eviction now credits mark-to-market value back
+            # to balance instead of silently destroying capital.
+            # Positions >48h old have almost certainly resolved on-chain;
+            # we settle at current mid-price as best estimate.
+            #
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+            stale  = [
+                k for k, p in account.positions.items()
+                if datetime.fromisoformat(
+                    p.get("opened_at", "2000-01-01T00:00:00+00:00")
+                    .replace("Z", "+00:00")
+                ) < cutoff
+            ]
+            for k in stale:
+                p = account.positions.get(k)
+                if not p: continue
+                # Best-guess settle price from current market mid
+                m = mkt_map.get(p.get("market_id", ""))
+                if m:
+                    if p["outcome"] == "YES":
+                        cur = _mid(m.yes_ask, m.yes_bid)
+                    else:
+                        cur = _mid(m.no_ask, m.no_bid)
+                else:
+                    cur = 0.0   # Market gone from scan — assume total loss
+                account.settle(k, cur)
+                log.info(f"Evicted stale position {k[:20]} at {cur:.3f}")
+
+            # ── Deduplication + execution ─────────────────────────────────────
+            held  = set(account.positions.keys())
+            seen  = set(); clean = []
             for sig in sorted(signals, key=lambda x: x["edge"], reverse=True):
                 if sig["token_id"] in held or sig["token_id"] in seen: continue
                 seen.add(sig["token_id"]); clean.append(sig)
@@ -900,68 +1070,82 @@ async def run():
                 strat_cnt[sig["strategy"]] = strat_cnt.get(sig["strategy"], 0) + 1
             all_sigs = (signals + all_sigs)[:50]
 
-            # Execute top signals
             for sig in signals[:5]:
                 if account.balance < MIN_BET_SIZE: break
-                t = account.buy(sig["market_id"], sig["question"],
+                t = account.buy(
+                    sig["market_id"], sig["question"],
                     sig["token_id"], sig["outcome"], sig["price"],
-                    sig["size"], sig["strategy"], sig["edge"])
+                    sig["size"], sig["strategy"], sig["edge"]
+                )
                 if t:
-                    log.info(f"TRADE {t['id']} {sig['strategy']} "
-                             f"{sig['outcome']} @{sig['price']:.4f} "
-                             f"${t['cost']:.2f} edge={sig['edge']:.4f}")
+                    log.info(
+                        f"TRADE {t['id']} {sig['strategy']} "
+                        f"{sig['outcome']} @{sig['price']:.4f} "
+                        f"${t['cost']:.2f} edge={sig['edge']:.4f}"
+                    )
 
-            # Write state
+            # ── State write ───────────────────────────────────────────────────
             btc = crypto.get("btcusdt")
             eth = crypto.get("ethusdt")
             edge_top = max((s["edge"] for s in all_sigs[:10]), default=0.0)
 
-            # Mark-to-market: estimate unrealized PnL using current market prices
-            # For each open position, compare entry price to current mid-price
-            mkt_map = {m.condition_id: m for m in markets}
-            pos_out = {}
             total_unrealized = 0.0
+            pos_out = {}
             for tid, p in account.positions.items():
-                m = mkt_map.get(p.get("market_id",""))
+                m = mkt_map.get(p.get("market_id", ""))
                 if m:
-                    cur = m.yes_ask if p["outcome"]=="YES" else m.no_ask
+                    cur    = m.yes_ask if p["outcome"] == "YES" else m.no_ask
                     unreal = (cur - p["avg_entry"]) * p["size"]
                 else:
                     unreal = 0.0
                 total_unrealized += unreal
-                pos_out[tid] = {**p,
+                pos_out[tid] = {
+                    **p,
                     "unrealized_pnl": round(unreal, 4),
-                    "pnl_pct": round((unreal / max(p["avg_entry"]*p["size"], 0.01)) * 100, 2)}
+                    "pnl_pct": round(
+                        (unreal / max(p["avg_entry"] * p["size"], 0.01)) * 100, 2
+                    ),
+                }
 
             nav_mtm = account.balance + account.invested + total_unrealized
 
+            feed_label = "BINANCE_WS" if crypto_feed.ws_ok else "COINGECKO"
+
             save_json(STATE_FILE, {
-                "balance":          account.balance,
-                "positions":        pos_out,
-                "trades":           account.trades[-100:],
-                "realized_pnl":     account.realized_pnl,
-                "unrealized_pnl":   round(total_unrealized, 4),
-                "nav":              account.nav,
-                "nav_mtm":          round(nav_mtm, 2),
-                "win_rate":         account.win_rate,
-                "total_fees":       account.total_fees,
-                "num_trades":       len(account.trades),
+                "balance":        account.balance,
+                "positions":      pos_out,
+                "trades":         account.trades[-100:],
+                "realized_pnl":   account.realized_pnl,
+                "unrealized_pnl": round(total_unrealized, 4),
+                "nav":            account.nav,
+                "nav_mtm":        round(nav_mtm, 2),
+                "win_rate":       account.win_rate,
+                "total_fees":     account.total_fees,
+                "num_trades":     len(account.trades),
                 "markets": [
-                    {"question": m.question[:80],
-                     "yes_price": m.yes_ask, "no_price": m.no_ask,
-                     "yes_bid": m.yes_bid, "no_bid": m.no_bid,
-                     "category": m.category,
-                     "neg_risk_edge": m.neg_risk_edge,
-                     "yes_depth": round(m.yes_depth, 2),
-                     "volume": m.volume}
-                    for m in sorted(markets,
-                        key=lambda x: x.neg_risk_edge, reverse=True)[:150]
+                    {
+                        "question":      m.question[:80],
+                        "yes_price":     m.yes_ask,
+                        "no_price":      m.no_ask,
+                        "yes_bid":       m.yes_bid,
+                        "no_bid":        m.no_bid,
+                        "category":      m.category,
+                        "neg_risk_edge": m.neg_risk_edge,
+                        "yes_depth":     round(m.yes_depth, 2),
+                        "volume":        m.volume,
+                    }
+                    for m in sorted(markets, key=lambda x: x.neg_risk_edge, reverse=True)[:150]
                 ],
-                "signals":      all_sigs[:30],
+                "signals":  all_sigs[:30],
                 "crypto": {
-                    k: {"symbol": v.symbol, "price": v.price,
-                        "bid": v.bid, "ask": v.ask,
-                        "return_5s": v.return_5s, "change_24h": v.change_24h}
+                    k: {
+                        "symbol":    v.symbol,
+                        "price":     v.price,
+                        "bid":       v.bid,
+                        "ask":       v.ask,
+                        "return_5s": v.return_10s,   # keep key name for dashboard compat
+                        "change_24h": v.change_24h,
+                    }
                     for k, v in crypto.items()
                 },
                 "nav_history":  nav_hist[-200:],
@@ -969,7 +1153,8 @@ async def run():
                 "scan_count":   scan_n,
                 "market_count": len(markets),
                 "engine_alive": True,
-                "ws_connected": crypto_feed._ws_ok,
+                "ws_connected": crypto_feed.ws_ok,
+                "crypto_source": feed_label,
                 "edge_top":     round(edge_top, 4),
                 "saved_at":     datetime.now(timezone.utc).isoformat(),
             })
